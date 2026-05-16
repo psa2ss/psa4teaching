@@ -8,6 +8,7 @@
 3. 不对称短路计算（单相接地、两相短路、两相接地）
 4. 序网模型构造
 5. GB15544标准支持
+6. 同步发电机机端三相短路计算（三种方法）
 
 参考教材：
     - 陈珩《电力系统稳态分析》第六章
@@ -36,6 +37,15 @@ from psa4teaching.shortcircuit.gb15544 import (
     calculate_gb15544,
     get_correction_factor,
 )
+from psa4teaching.shortcircuit.terminal_shortcircuit import (
+    GeneratorSCParams,
+    TerminalSCResult,
+    calculate_terminal_shortcircuit_mathematical,
+    calculate_terminal_shortcircuit_experimental,
+    calculate_terminal_shortcircuit_simplified,
+    plot_comparison,
+    plot_components_comparison,
+)
 
 __all__ = [
     # 对称短路
@@ -48,4 +58,10 @@ __all__ = [
     "build_negative_sequence_network", "build_zero_sequence_network",
     # GB15544
     "GB15544Result", "calculate_gb15544", "get_correction_factor",
+    # 机端三相短路
+    "GeneratorSCParams", "TerminalSCResult",
+    "calculate_terminal_shortcircuit_mathematical",
+    "calculate_terminal_shortcircuit_experimental",
+    "calculate_terminal_shortcircuit_simplified",
+    "plot_comparison", "plot_components_comparison",
 ]
