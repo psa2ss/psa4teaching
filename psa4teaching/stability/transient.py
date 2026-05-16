@@ -95,6 +95,7 @@ def simulate_single_machine_infinite_bus_classic(
     fault_time: float,
     fault_clearing_time: float,
     X_total_fault: Optional[float] = None,
+    X_total_post: Optional[float] = None,
     t_end: float = 5.0,
     dt: float = 0.005,
     method: str = "rk4",
@@ -114,6 +115,7 @@ def simulate_single_machine_infinite_bus_classic(
         fault_time: 故障发生时刻（秒）
         fault_clearing_time: 故障清除时刻（秒）
         X_total_fault: 故障期间等值电抗（标幺值，默认X_total的2倍）
+        X_total_post: 故障后等值电抗（标幺值，默认与X_total相同）
         t_end: 仿真结束时间（秒）
         dt: 仿真步长（秒）
         method: 积分方法，"rk4"（龙格-库塔）或 "euler"（改进欧拉）
@@ -127,7 +129,7 @@ def simulate_single_machine_infinite_bus_classic(
         仿真过程：
         1. 故障前：使用X_total计算Pe
         2. 故障期间（t_fault ≤ t ≤ t_clear）：使用X_total_fault计算Pe
-        3. 故障后：恢复使用X_total计算Pe
+        3. 故障后：使用X_total_post计算Pe（切除故障线路后网络变化）
         4. 判断是否稳定：功角δ是否持续增长或超过稳定性限制
 
     Example:
@@ -140,10 +142,13 @@ def simulate_single_machine_infinite_bus_classic(
     """
     if X_total_fault is None:
         X_total_fault = X_total * 2.0
+    if X_total_post is None:
+        X_total_post = X_total
 
-    # 功率系数
-    P_max_normal = E_prime * V_infinity / X_total
+    # 功率系数（三段工况）
+    P_max_pre = E_prime * V_infinity / X_total
     P_max_fault = E_prime * V_infinity / X_total_fault
+    P_max_post = E_prime * V_infinity / X_total_post
 
     # 初始条件
     delta = delta_0
@@ -167,11 +172,11 @@ def simulate_single_machine_infinite_bus_classic(
         """计算导数"""
         # 确定当前使用哪组参数
         if t < fault_time:
-            P_max = P_max_normal
+            P_max = P_max_pre
         elif t < fault_clearing_time:
             P_max = P_max_fault
         else:
-            P_max = P_max_normal
+            P_max = P_max_post
 
         Pe = P_max * np.sin(delta_val)
         d_delta = (omega_val - 1.0)  # dδ/dt = Δω × ωs（标幺值）

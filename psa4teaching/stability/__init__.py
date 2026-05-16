@@ -5,6 +5,7 @@
 本模块提供电力系统稳定性计算功能，包括：
 1. 暂态稳定时域仿真
 2. 小干扰稳定分析（特征值法）
+3. 等面积准则 + 摇摆曲线交互展示
 
 支持模型：
 - 单机无穷大系统：经典模型 + 详细模型
@@ -24,6 +25,11 @@ from psa4teaching.stability.small_signal import (
     analyze_single_machine_infinite_bus,
     analyze_multi_machine,
 )
+from psa4teaching.stability.equal_area_interactive import (
+    EqualAreaParams,
+    EqualAreaInteractive,
+    show_equal_area_interactive,
+)
 
 __all__ = [
     # 暂态稳定
@@ -35,4 +41,8 @@ __all__ = [
     "SmallSignalResult",
     "analyze_single_machine_infinite_bus",
     "analyze_multi_machine",
+    # 等面积准则交互工具
+    "EqualAreaParams",
+    "EqualAreaInteractive",
+    "show_equal_area_interactive",
 ]
