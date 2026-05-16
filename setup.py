@@ -27,20 +27,4 @@ setup(
     install_requires=[
         "numpy>=1.20.0",
     ],
-    extras_require={
-        "dev": [
-            "pytest>=6.0",
-            "pytest-cov>=2.0",
-            "matplotlib>=3.5",
-        ],
-        "docs": [
-            "sphinx>=4.0",
-            "sphinx-rtd-theme>=1.0",
-        },
-    },
-    entry_points={
-        "console_scripts": [
-            "psa-run=psa4teaching.cli:main",
-        ],
-    },
 )
