@@ -88,7 +88,8 @@ class AsymmetricFaultResult:
     Attributes:
         fault_type: 故障类型
         fault_bus: 故障点节点编号
-        fault_current: 故障点电流（a相电流）
+        fault_current: 故障点电流（复数，故障相电流）：
+                       单相接地→Ia(=3Ia0)，两相短路→Ib，两相接地→Ia(=3Ia0)
         fault_currents_3phase: 三相故障电流 (Ia, Ib, Ic)
         sequence_currents: 序电流 (I0, I1, I2)
         sequence_voltages: 故障点序电压 (V0, V1, V2)
@@ -259,8 +260,9 @@ def calculate_line_to_line(
     # 三相电流
     Ia_3ph, Ib_3ph, Ic_3ph = sequence_to_phase(Ia0, Ia1, Ia2)
 
-    # 故障电流（a相电流）
-    Ia = Ia0 + Ia1 + Ia2  # = 0
+    # 故障电流：取故障相（b相）电流，保持 complex 类型
+    # 两相短路时 a 相电流为 0，bc 相电流 Ib = -Ic = -j√3 × Ia1
+    fault_current_bc = Ib_3ph
 
     # 故障点序电压
     Va1 = Ea - Ia1 * Z1_total
@@ -270,7 +272,7 @@ def calculate_line_to_line(
     return AsymmetricFaultResult(
         fault_type="两相短路(bc相)",
         fault_bus=fault_bus,
-        fault_current=Ia,
+        fault_current=fault_current_bc,
         fault_currents_3phase=(Ia_3ph, Ib_3ph, Ic_3ph),
         sequence_currents=(Ia0, Ia1, Ia2),
         sequence_voltages=(Va0, Va1, Va2),
