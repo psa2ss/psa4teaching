@@ -25,6 +25,8 @@ from psa4teaching.shortcircuit.asymmetric import (
     calculate_single_line_to_ground,
     calculate_line_to_line,
     calculate_double_line_to_ground,
+    phase_to_sequence,
+    sequence_to_phase,
 )
 from psa4teaching.shortcircuit.sequence_network import (
     SequenceNetworks,
@@ -53,6 +55,7 @@ __all__ = [
     # 不对称短路
     "AsymmetricFaultResult", "calculate_single_line_to_ground",
     "calculate_line_to_line", "calculate_double_line_to_ground",
+    "phase_to_sequence", "sequence_to_phase",
     # 序网
     "SequenceNetworks", "build_positive_sequence_network",
     "build_negative_sequence_network", "build_zero_sequence_network",
