@@ -6,7 +6,7 @@ setup(
     author="PSA Teaching Team",
     author_email="psa@example.edu",
     description="电力系统分析教学Python包",
-    long_description=open("README.md").read(),
+    long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     url="https://github.com/psa2ss/psa4teaching",
     packages=find_packages(),
