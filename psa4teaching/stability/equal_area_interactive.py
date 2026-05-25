@@ -142,29 +142,29 @@ class EqualAreaInteractive:
         d_deg = np.degrees(d)
 
         ax.plot(d_deg, self.Pmax_pre * np.sin(d), 'b-', lw=2.5,
-                label=f'故障前 $P_{{\max}}={self.Pmax_pre:.2f}$')
+                label=r'故障前 $P_{\max}=' + f'{self.Pmax_pre:.2f}' + r'$')
         ax.plot(d_deg, np.zeros_like(d), 'r-', lw=2.5,
-                label='故障中 $P=0$ (三相短路)')
+                label=r'故障中 $P=0$ (三相短路)')
         ax.plot(d_deg, self.Pmax_post * np.sin(d), 'g-', lw=2.5,
-                label=f'故障后 $P\'_{{\max}}={self.Pmax_post:.2f}$')
+                label=r"故障后 $P'_{\max}=" + f'{self.Pmax_post:.2f}' + r'$')
 
         # 2. 机械功率线
         ax.axhline(p.Pm, color='k', ls='--', lw=1.5, label=f'$P_m={p.Pm}$')
 
         # 3. 关键点
         ax.plot(np.degrees(self.delta0), p.Pm, 'ko', ms=8, zorder=10,
-                label=f'$\\delta_0={np.degrees(self.delta0):.1f}^\\circ$')
+                label=r'$\delta_0=' + f'{np.degrees(self.delta0):.1f}' + r'^\circ$')
 
         if self.delta_s:
             ax.plot(np.degrees(self.delta_s), p.Pm, 'gv', ms=7, zorder=10,
-                    label=f'$\\delta_s={np.degrees(self.delta_s):.1f}^\\circ$')
+                    label=r'$\delta_s=' + f'{np.degrees(self.delta_s):.1f}' + r'^\circ$')
             ax.plot(np.degrees(self.delta_max_stable), p.Pm, 'rv', ms=7, zorder=10,
-                    label=f'$\\delta_{{\max}}={np.degrees(self.delta_max_stable):.1f}^\\circ$')
+                    label=r'$\delta_{\max}=' + f'{np.degrees(self.delta_max_stable):.1f}' + r'^\circ$')
 
         # 4. 临界切除角线
         dc_crit_deg = np.degrees(self.delta_crit)
         ax.axvline(dc_crit_deg, color='gray', ls=':', lw=1, alpha=0.5,
-                    label=f'$\\delta_{{crit}}={dc_crit_deg:.1f}^\\circ$')
+                    label=r'$\delta_{crit}=' + f'{dc_crit_deg:.1f}' + r'^\circ$')
 
         # 5. 当前切除角 + 面积填充
         if t_clear is not None:
@@ -173,7 +173,7 @@ class EqualAreaInteractive:
             if dc and dc > self.delta0 + 0.01:
                 dc_deg = np.degrees(dc)
                 ax.plot([dc_deg], [p.Pm], 'o', color='magenta', ms=12, zorder=15,
-                        label=f'$\\delta_c={dc_deg:.1f}^\\circ$')
+                        label=r'$\delta_c=' + f'{dc_deg:.1f}' + r'^\circ$')
                 ax.axvline(dc_deg, color='magenta', ls='-', lw=1.5, alpha=0.4)
 
                 # 加速面积
@@ -254,17 +254,17 @@ class EqualAreaInteractive:
         t = self.result.time
 
         color = 'green' if self.result.stable else 'red'
-        ax.plot(delta_deg, t, color=color, lw=2.2, label='$\\delta(t)$')
+        ax.plot(delta_deg, t, color=color, lw=2.2, label=r'$\delta(t)$')
 
         # 标记点
-        ax.plot(delta_deg[0], t[0], 'ko', ms=6, label=f'$\\delta_0$')
+        ax.plot(delta_deg[0], t[0], 'ko', ms=6, label=r'$\delta_0$')
         idx_c = np.argmin(np.abs(t - self.t_clear))
         ax.plot(delta_deg[idx_c], self.t_clear, 'o', color='magenta', ms=10, zorder=10,
-                label=f'$\\delta_c$ @ t={self.t_clear:.2f}s')
+                label=r'$\delta_c$ @ t=' + f'{self.t_clear:.2f}s')
 
         # 临界角线
         ax.axvline(np.degrees(self.delta_crit), color='red', ls='--', lw=1, alpha=0.5,
-                    label=f'$\\delta_{{crit}}$')
+                    label=r'$\delta_{crit}$')
 
         # 标题
         status = '稳定 ✓' if self.result.stable else '失稳 ✗'
