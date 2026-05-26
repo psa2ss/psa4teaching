@@ -52,10 +52,10 @@ def build_entsoe_smib_system():
     """
     # 节点定义（基准电压21kV/380kV）
     buses = [
-        Bus(1, "NGEN", BusType.PV, V_specified=1.0),
-        Bus(2, "NTLV", BusType.PQ),
-        Bus(3, "NTHV", BusType.PQ),
-        Bus(4, "NGRID", BusType.SLACK, V_specified=1.0),
+        Bus(1, "NGEN", BusType.PV, V_specified=1.0, base_kv=21.0),
+        Bus(2, "NTLV", BusType.PQ, base_kv=21.0),
+        Bus(3, "NTHV", BusType.PQ, base_kv=380.0),
+        Bus(4, "NGRID", BusType.SLACK, V_specified=1.0, base_kv=380.0),
     ]
 
     # 线路（简化模型）

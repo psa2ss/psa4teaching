@@ -81,6 +81,9 @@ class Bus:
     Q_specified: float = 0.0             # 指定无功功率
     V_specified: float = 1.0              # 指定电压幅值
 
+    # 节点基准电压（kV），用于标幺值转换
+    base_kv: Optional[float] = None        # 节点基准电压（kV）
+
     # PV节点无功出力限制
     Q_min: float = -999.0                # 无功出力下限
     Q_max: float = 999.0                 # 无功出力上限
