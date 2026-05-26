@@ -52,17 +52,17 @@ def build_entsoe_smib_system():
     """
     # 节点定义（基准电压21kV/380kV）
     buses = [
-        Bus(1, "NGEN", BusType.PV, V_specified=1.0, base_kv=21.0),
-        Bus(2, "NTLV", BusType.PQ, base_kv=21.0),
-        Bus(3, "NTHV", BusType.PQ, base_kv=380.0),
-        Bus(4, "NGRID", BusType.SLACK, V_specified=1.0, base_kv=380.0),
+        Bus(1, "NGEN", BusType.PV, V_specified=1.0),
+        Bus(2, "NTLV", BusType.PQ),
+        Bus(3, "NTHV", BusType.PQ),
+        Bus(4, "NGRID", BusType.SLACK, V_specified=1.0),
     ]
 
     # 线路（简化模型）
     line1 = Line(
         from_bus=1, to_bus=2,
         R=0.001, X=0.01, B=0.0,
-        rating=500.0, name="L1_NGEN_NTLV"
+        name="L1_NGEN_NTLV"
     )
 
     # NTHV - NGRID: 高压侧到无穷大系统
@@ -73,7 +73,7 @@ def build_entsoe_smib_system():
     line2 = Line(
         from_bus=3, to_bus=4,
         R=0.02, X=0.2, B=0.0,
-        rating=2500.0, name="L2_NTHV_NGRID"
+        name="L2_NTHV_NGRID"
     )
 
     # 变压器 21/380 kV (uk=16%, 500 MVA)
@@ -81,9 +81,9 @@ def build_entsoe_smib_system():
     # 考虑变比 21/419kV
     transformer = Transformer(
         from_bus=2, to_bus=3,
-        R=0.0, X=0.16,
-        rating=500.0, name="T1_GEN_GRID",
-        tap_ratio=419.0/21.0
+        RT=0.0, XT=0.16,
+        name="T1_GEN_GRID",
+        k=419.0/21.0
     )
 
     lines = [line1, line2]
@@ -126,8 +126,8 @@ def build_entsoe_smib_system():
     # 负荷（恒阻抗模型）
     load = Load(
         bus=1,
-        P=0.95, Q=0.152,
-        model=LoadModel.CONSTANT_IMPEDANCE,
+        P0=0.95, Q0=0.152,
+        model_type=LoadModel.CONSTANT_IMPEDANCE,
         name="LOAD1"
     )
 
