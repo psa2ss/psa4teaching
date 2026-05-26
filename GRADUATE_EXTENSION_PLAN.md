@@ -13,12 +13,13 @@
 3. [电力系统状态估计](#3-电力系统状态估计)
 4. [电压稳定性分析](#4-电压稳定性分析)
 5. [高级稳定分析](#5-高级稳定分析)
-6. [电力系统规划与可靠性](#6-电力系统规划与可靠性)
-7. [电力市场基础](#7-电力市场基础)
-8. [柔性输电（FACTS）与新能源接入](#8-柔性输电facts与新能源接入)
-9. [高压直流输电（HVDC）](#9-高压直流输电hvdc)
-10. [扩展路线图与优先级总览](#10-扩展路线图与优先级总览)
-11. [总结](#11-总结)
+6. [ENTSO-E标准测试系统与控制器校验](#54-entso-e标准测试系统与控制器校验案例)
+7. [电力系统规划与可靠性](#6-电力系统规划与可靠性)
+8. [电力市场基础](#7-电力市场基础)
+9. [柔性输电（FACTS）与新能源接入](#8-柔性输电facts与新能源接入)
+10. [高压直流输电（HVDC）](#9-高压直流输电hvdc)
+11. [扩展路线图与优先级总览](#10-扩展路线图与优先级总览)
+12. [总结](#11-总结)
 
 ---
 
@@ -1099,6 +1100,508 @@ def run_eeac_analysis(
 
 ---
 
+### 5.4 ENTSO-E标准测试系统与控制器校验案例
+
+**教学目标**
+- 掌握业界标准的单机无穷大（SMIB）测试系统配置与参数
+- 理解 TGOV1 调速器、SEXS 励磁系统、PSS2A 稳定器的完整数学模型
+- 能够通过三个标准化测试案例验证控制器模型的正确性
+- 培养跨仿真工具对比验证的工程能力
+
+**参考来源**：ENTSO-E SG SPD 报告《Documentation on Controller Tests in Test Grid Configurations》（2013-11-26）
+
+---
+
+#### 5.4.1 测试系统网络结构
+
+ENTSO-E SG SPD（系统保护与动态）工作组定义的标准 SMIB 测试系统，用于对比六种不同仿真工具中同步发电机及控制器模型的动态行为。该系统为四节点结构：
+
+```
+NGEN (21 kV) ─ NTLV (21 kV) ─ NTHV (380 kV) ─ NGRID (380 kV)
+    │              │               │               │
+   GEN           S-GEN           T-GEN          S-GRID
+ + GOV/AVR/PSS     ↑          升压变压器          ↑    ─── GRID (无穷大母线)
+                   │                                │    Sk'' = 2500 MVA
+               机端断路器                       高压侧断路器    GRIDL (恒阻抗负荷)
+```
+
+**四个节点**：
+- **NGEN**：发电机端，额定电压 21 kV
+- **NTLV**：变压器低压侧，额定电压 21 kV
+- **NTHV**：变压器高压侧，额定电压 380 kV
+- **NGRID**：无穷大系统母线，额定电压 380 kV
+
+**额定频率**：$f_n = 50\,\text{Hz}$，$\omega_n = 2\pi f_n = 100\pi\,\text{rad/s}$
+
+---
+
+#### 5.4.2 同步发电机模型与参数
+
+**基础参数**（500 MVA 隐极机）
+
+| 参数 | 数值 | 基准单位 | 说明 |
+|------|------|----------|------|
+| $S_{r,G}$ | 500 | MVA | 额定视在功率 |
+| $U_{r,G}$ | 21 | kV | 额定电压 |
+| $\cos\phi_r$ | 0.95 | — | 额定功率因数 |
+| $f_r$ | 50 | Hz | 额定频率 |
+| $n_r$ | 3000 | 1/min | 额定转速 |
+| $T_A$ | 8 | s | 惯性时间常数（含原动机） |
+| $H$ | 4 | MW·s/MVA | 惯性常数 |
+| $GD^2$ | 162.114 | Mp·m² | 飞轮力矩 |
+
+**电抗与时间常数**
+
+| 参数 | 数值 (p.u.) | 参数 | 数值 (s) | 参数 | 数值 (p.u.) |
+|------|-------------|------|----------|------|-------------|
+| $x_d$ | 2.0 | $T'_d$ | 0.9 | $x_q$ | 1.8 |
+| $x'_d$ | 0.35 | $T''_d$ | 0.03 | $x'_q$ | 0.5 |
+| $x''_d$ | 0.25 | $T'_{do}$ | 5.143 | $x''_q$ | 0.3 |
+| $x_{a\sigma}$ | 0.15 | $T''_{do}$ | 0.042 | $T'_q$ | 0.6 |
+| $r_a$ | 0 | — | — | $T''_q$ | 0.05 |
+| | | $T'_{qo}$ | 2.16 | $T''_{qo}$ | 0.083 |
+
+**关键特性**：
+- 忽略饱和效应（$E_{fd}$ 基于气隙线定义）
+- 忽略定子电阻损耗
+- 采用隐极机模型（$x_d \neq x_q$，但有交轴暂态）
+
+---
+
+#### 5.4.3 TGOV1 调速器模型
+
+**模型类型**：简单蒸汽涡轮调速器（对应 CIM 名 "GOVSTEAM0"）
+
+**框图**：
+```
+               VMAX
+                 │
+    1/sR ──► 1/(1+sT1) ──► (1+sT2)/(1+sT3) ──►(+)──► PMECH
+Ref(L)─(+)──►              ┃                    ▲       ┃
+         ┃              VMIN                   │       ┃
+         ┃                              ┌──────┘       ┃
+         ┃Δω──► [Dt] ──────────────────►(+)─────────────┘
+```
+
+**参数表**：
+
+| 参数 | 数值 | 单位 | 说明 |
+|------|------|------|------|
+| $R$ | 0.05 | — | 调差系数（下垂） |
+| $T_1$ | 0.5 | s | 调速器时间常数 |
+| $T_2$ | 3 | s | 涡轮微分时间常数 |
+| $T_3$ | 10 | s | 涡轮延时时间常数 |
+| $D_t$ | 0 | — | 摩擦损耗系数 |
+| $V_{MIN}$ | 0 | p.u. | 下限幅 |
+| $V_{MAX}$ | 1 | p.u. | 上限幅 |
+
+**传递函数**：
+$$G_{gov}(s) = \frac{1}{R} \cdot \frac{1}{1 + sT_1} \cdot \frac{1 + sT_2}{1 + sT_3}$$
+
+机械功率参考值基于原动机额定功率 $P_{r,MECH} = P_{r,G} = 475$ MW。
+
+---
+
+#### 5.4.4 SEXS 简化励磁系统模型
+
+**模型类型**：Simplified Excitation System（对应 CIM 名 "ExcSEXS"，此处禁用 PI 环节）
+
+**框图**：
+```
+V_ref ──(+)──► (1+sTA)/(1+sTB) ──► K/(1+sTE) ──► EFD
+          ┃                         ┃      ┃
+          ┃                     EMAX     EMIN
+          ┃                ┌─────┘
+          ┃                ▼
+      VC(+)──► Σ ◄── VS (PSS输出)
+```
+
+**参数表**：
+
+| 参数 | 数值 | 单位 | 说明 |
+|------|------|------|------|
+| $K$ | 200 | — | 控制器增益 |
+| $T_A$ | 3 | s | 滤波器微分时间常数 |
+| $T_B$ | 10 | s | 滤波器延时时间常数 |
+| $T_E$ | 0.05 | s | 励磁机时间常数 |
+| $E_{MIN}$ | 0 | p.u. | 最小输出限幅 |
+| $E_{MAX}$ | 4 | p.u. | 最大输出限幅 |
+
+**传递函数**：
+$$G_{exc}(s) = \frac{1 + sT_A}{1 + sT_B} \cdot \frac{K}{1 + sT_E}$$
+
+其中 $V_S$ 为 PSS 输出信号，叠加到电压偏差信号上。
+
+---
+
+#### 5.4.5 PSS2A 电力系统稳定器模型
+
+**模型类型**：IEEE 标准 PSS2A 双输入电力系统稳定器（对应 IEEE Std 421.5-2005）
+
+**框图**：
+```
+Δω ──► sTW1/(1+sTW1) ──► sTW2/(1+sTW2) ──►(+)──► 1/(1+sT6) ──►(+)──► KS1 ──► …
+                                              ┃                 ▲
+                                              ┃  (1+sT8)^N     ┃
+                                              ┃  (1+sT9)^M     ┃
+                                    ┌─────────┘                 ┃
+                                    ▼                           ┃
+P_gen ──► sTW3/(1+sTW3) ──► sTW4/(1+sTW4) ──► KS2/(1+sT7) ────┘
+                                                                    ▼
+                                        1+sT1  1+sT3
+  … ──► [KS3] ──► ┌───────────────────► ──── ── ──── ──► ─────────► V_ST
+                   │                   1+sT2  1+sT4     限幅
+                   │                              VST_MAX / VST_MIN
+                   └────────── VOTHSG ────► (输出到 AVR 的 VS 节点)
+```
+
+**参数表**：
+
+| 参数 | 数值 | 单位 | 说明 |
+|------|------|------|------|
+| $K_{S1}$ | 10 | — | PSS 增益 |
+| $K_{S2}$ | 0.1564 | — | 第二信号通道系数 |
+| $K_{S3}$ | 1 | — | 清洗环节耦合系数 |
+| $T_{W1}$ | 2 | s | 第一通道第一清洗时间常数 |
+| $T_{W2}$ | 2 | s | 第一通道第二清洗时间常数 |
+| $T_{W3}$ | 2 | s | 第二通道第一清洗时间常数 |
+| $T_{W4}$ | 0 | s | 第二通道第二清洗时间常数 |
+| $T_1$ | 0.25 | s | 第一超前滞后微分时间常数 |
+| $T_2$ | 0.03 | s | 第一超前滞后延时时间常数 |
+| $T_3$ | 0.15 | s | 第二超前滞后微分时间常数 |
+| $T_4$ | 0.015 | s | 第二超前滞后延时时间常数 |
+| $T_6$ | 0 | s | 第一信号传感器时间常数 |
+| $T_7$ | 2 | s | 第二信号传感器时间常数 |
+| $T_8$ | 0.5 | s | 斜坡跟踪滤波器微分时间常数 |
+| $T_9$ | 0.1 | s | 斜坡跟踪滤波器延时时间常数 |
+| $V_{ST,MIN}$ | −0.1 | p.u. | 最小输出 |
+| $V_{ST,MAX}$ | 0.1 | p.u. | 最大输出 |
+| $N$ | 0 | — | 斜坡跟踪滤波器阶数 |
+| $M$ | 0 | — | 斜坡跟踪滤波器阶数 |
+| $I_{C1}$ | 1 | — | 第一输入通道选择 |
+| $I_{C2}$ | 3 | — | 第二输入通道选择 |
+
+**输入信号**：
+- 通道1（$I_{C1}=1$）：转速偏差 $\Delta\omega$
+- 通道2（$I_{C2}=3$）：发电机有功功率 $P_{GEN}$
+
+---
+
+#### 5.4.6 升压变压器与无穷大系统
+
+**单元变压器 T-GEN**（理想变压器，忽略饱和）：
+
+| 参数 | 数值 | 单位 | 说明 |
+|------|------|------|------|
+| $S_{r,T}$ | 500 | MVA | 额定容量 |
+| $U_{r,THV}$ | 419 | kV | 高压侧额定电压 |
+| $U_{r,TLV}$ | 21 | kV | 低压侧额定电压 |
+| $u_r$ | 0.15 | % | 短路电阻百分比 |
+| $u_k$ | 16 | % | 短路阻抗百分比 |
+
+**等效电网 GRID**（无穷大母线）：
+
+| 参数 | 数值 | 单位 | 说明 |
+|------|------|------|------|
+| $S''_k$ | 2500 | MVA | 短路容量 |
+| $U_r$ | 380 | kV | 额定电压 |
+| $R/X$ | 0.1 | — | 电阻/电抗比 |
+| $c$ | 1.1 | — | 短路计算系数 |
+| $R$ | 6.322 | Ω | 等效电阻 |
+| $X$ | 63.22 | Ω | 等效电抗 |
+
+**恒阻抗负荷 GRIDL**：
+- 恒阻抗特性（$P, Q \propto V^2$，频率无关）
+- 初始值 $P_{GRIDL} = 475$ MW, $Q_{GRIDL} = 76$ MVar（在 1 p.u. 电压下）
+
+---
+
+#### 5.4.7 基准潮流工况
+
+发电机出力设定值：
+$$
+\begin{cases}
+P_{G,setp} = 475\,\text{MW} \\
+Q_{G,setp} = 156\,\text{MVar} \\
+\end{cases}
+$$
+
+无穷大母线设定值：
+$$
+\begin{cases}
+U_{NGRID,setp} = 1.05\,\text{p.u.} \\
+\delta_{NGRID,setp} = 0^\circ \\
+\end{cases}
+$$
+
+**潮流结果**：
+| 节点 | 电压 (p.u.) | 相角 (°) |
+|------|-------------|----------|
+| NGEN | 0.992 | 9.233 |
+| NTLV | 0.992 | 9.233 |
+| NTHV | 1.050 | 0 |
+| NGRID | 1.050 | 0 |
+
+发电机：$P_G = 475$ MW, $Q_G = 156$ MVar
+
+---
+
+#### 5.4.8 三个标准化测试案例
+
+**测试条件**：
+- 固定仿真步长 $\Delta t = 1$ ms
+- 事件发生时间 $t = 0.1$ s
+- 初始转速始终为额定同步转速 1 p.u.
+
+---
+
+**测试案例 1：电压参考值阶跃（AVR 响应测试）**
+
+**目的**：测试同步发电机 + AVR 的动态特性，对比不同仿真工具中机端电压 $U_{NGEN}$ 和励磁电压 $E_{FD}$ 的响应。
+
+**网络配置**：
+- 空载工况（断开机端断路器 S-GEN）
+- $U_{NGEN} = 1$ p.u.，$E_{FD_0} = 1$ p.u.
+- PSS 和调速器不参与
+
+**事件**：在 $t = 0.1$ s 时，电压参考值阶跃增加 $\Delta U_{NGEN,setp} = +0.05$ p.u.
+
+**仿真时长**：2 s
+
+**待分析输出量**：$U_{NGEN}(t)$, $E_{FD}(t)$
+
+**教学意义**：
+- 验证励磁系统的稳态精度（阶跃响应无静差）
+- 观察励磁电压的动态响应过程（超调量、响应时间）
+- 对比不同仿真工具的数值积分差异
+
+---
+
+**测试案例 2：负荷功率阶跃（调速器响应测试）**
+
+**目的**：测试同步发电机 + 调速器的动态特性，分析机端电压 $U_{NGEN}$、有功 $P_G$、机械功率 $P_{MECH}$、无功 $Q_G$ 和转速 $\omega_G$ 的响应。
+
+**网络配置**：
+- 隔离运行（S-GEN 仍断开）
+- 在 NGEN 节点附加恒阻抗负荷（初始 $P_L = 0.8 \cdot S_{r,G} \cdot \cos\phi_r = 380$ MW）
+- **必须关断 PSS**（避免干扰）
+
+**事件**：在 $t = 0.1$ s 时，负荷有功阶跃增加 $\Delta P_L = +0.05$ p.u.（以额定有功 $P_{r,G} = 475$ MW 为基准）
+
+**仿真时长**：15 s
+
+**待分析输出量**：$U_{NGEN}(t)$, $P_G(t)$, $P_{MECH}(t)$, $Q_G(t)$, $\omega_G(t)$
+
+**教学意义**：
+- 验证调速器的调差特性（下垂增益 $1/R$）
+- 观察转速的暂态响应和稳态偏差
+- 理解有功负荷变化与转速、频率的关系
+- 对比机械功率 $P_{MECH}$ 的响应滞后效应
+
+---
+
+**测试案例 3：三相短路故障（全控系统综合测试）**
+
+**目的**：在全部控制器（AVR + 调速器 + PSS）投入运行的情况下，测试三相短路故障后的动态响应。
+
+**网络配置**：
+- 采用基准潮流工况（S-GEN 闭合，移除测试案例 2 的附加负荷）
+- 全部控制器投入（AVR + TGOV1 + PSS2A）
+
+**事件**：
+- $t = 0.1$ s：在变压器高压侧节点 NTHV 发生金属性三相短路
+- 故障持续时间 $T_f = 0.1$ s
+- $t = 0.2$ s：故障清除，恢复初始系统状态
+
+**仿真时长**：10 s
+
+**待分析输出量**：$U_{NGEN}(t)$, $E_{FD}(t)$, $P_G(t)$, $Q_G(t)$, $\omega_G(t)$, $V_{OTHSG}(t)$, $P_{GRIDL}(t)$, $Q_{GRIDL}(t)$
+
+**教学意义**：
+- 综合验证全部控制器的协调响应能力
+- 观察 PSS 输出信号 $V_{OTHSG}$ 对振荡的抑制效果
+- 分析短路期间和清除后的电压恢复过程
+- 理解恒阻抗负荷在电压骤降时的功率特性
+- 对比有/无 PSS 时的阻尼效果（可通过关断 PSS 做对比实验）
+
+---
+
+#### 5.4.9 输入输出接口设计
+
+```python
+# psa4teaching/examples/entsoe_smib_demo.py
+
+@dataclass
+class ENTSOESMIBSystem:
+    """ENTSO-E SMIB 标准测试系统"""
+    gen: Generator
+    governor: TGOV1Params
+    exciter: SEXSParams
+    pss: PSS2AParams
+    transformer: UnitTransformer
+    grid: EquivalentGrid
+    load: ConstImpedanceLoad
+    pf_result: NewtonRaphsonResult
+
+# psa4teaching/models/governor.py
+
+@dataclass
+class TGOV1Params:
+    """TGOV1 调速器参数"""
+    R: float = 0.05           # 调差系数
+    T1: float = 0.5           # 调速器时间常数
+    T2: float = 3.0           # 涡轮微分时间常数
+    T3: float = 10.0          # 涡轮延时时间常数
+    Dt: float = 0.0           # 摩擦损耗系数
+    VMIN: float = 0.0         # 最小门限
+    VMAX: float = 1.0         # 最大门限
+    P_base_MW: float = 475.0  # 原动机额定有功 (MW)
+    
+    def get_transfer_function(self) -> Tuple[List, List]:
+        """返回传递函数分子分母系数 (num, den) 用于连续时间系统"""
+        pass
+    
+    def get_state_space(self) -> Tuple[NDArray, NDArray, NDArray, NDArray]:
+        """返回状态空间模型 (A, B, C, D)，用于集成到多机状态矩阵"""
+        pass
+
+@dataclass
+class SEXSParams:
+    """SEXS 简化励磁系统参数"""
+    K: float = 200.0          # 控制器增益
+    TA: float = 3.0           # 滤波器微分时间常数
+    TB: float = 10.0          # 滤波器延时时间常数
+    TE: float = 0.05          # 励磁机时间常数
+    EMIN: float = 0.0         # 最小限幅
+    EMAX: float = 4.0         # 最大限幅
+    
+    def get_transfer_function(self) -> Tuple[List, List]:
+        pass
+
+@dataclass
+class PSS2AParams:
+    """PSS2A 双输入电力系统稳定器参数（IEEE 421.5-2005）"""
+    KS1: float = 10.0         # PSS 增益
+    KS2: float = 0.1564       # 第二信号通道系数
+    KS3: float = 1.0          # 清洗耦合系数
+    TW1: float = 2.0          # 第一清洗时间常数 1
+    TW2: float = 2.0          # 第一清洗时间常数 2
+    TW3: float = 2.0          # 第二清洗时间常数 1
+    TW4: float = 0.0          # 第二清洗时间常数 2
+    T1: float = 0.25          # 第一超前滞后微分
+    T2: float = 0.03          # 第一超前滞后延时
+    T3: float = 0.15          # 第二超前滞后微分
+    T4: float = 0.015         # 第二超前滞后延时
+    T6: float = 0.0           # 第一信号传感器时间常数
+    T7: float = 2.0           # 第二信号传感器时间常数
+    T8: float = 0.5           # 斜坡跟踪微分
+    T9: float = 0.1           # 斜坡跟踪延时
+    VSTMIN: float = -0.1      # 最小输出
+    VSTMAX: float = 0.1       # 最大输出
+    N: float = 0              # 斜坡跟踪阶数
+    M: float = 0              # 斜坡跟踪阶数
+    IC1: int = 1              # 输入 1 选择 (1=Δω)
+    IC2: int = 3              # 输入 2 选择 (3=P_gen)
+    
+    def compute_stabilizing_signal(
+        self, delta_omega: float, p_gen: float, dt: float
+    ) -> float:
+        """
+        根据当前 Δω 和 P_gen 计算 PSS 输出信号 V_ST
+        含内部状态：各清洗环节 x_TW, 各路超前滞后 x_LL
+        """
+        pass
+    
+    def get_state_space(self) -> Tuple[NDArray, NDArray, NDArray, NDArray]:
+        """返回六阶状态空间模型"""
+        pass
+
+@dataclass
+class UnitTransformer:
+    """单元变压器（理想、忽略饱和）"""
+    S_r: float = 500.0        # MVA
+    U_r_HV: float = 419.0     # kV
+    U_r_LV: float = 21.0      # kV
+    u_r: float = 0.15         # %
+    u_k: float = 16.0         # %
+
+@dataclass
+class EquivalentGrid:
+    """等效电网（无穷大母线）"""
+    Sk: float = 2500.0        # MVA 短路容量
+    Ur: float = 380.0         # kV
+    R_over_X: float = 0.1
+    c_factor: float = 1.1
+    
+    @property
+    def R(self) -> float:
+        """计算等效电阻 (Ω)"""
+        return self.c_factor * self.Ur**2 / self.Sk * (self.R_over_X / np.sqrt(1 + self.R_over_X**2))
+    
+    @property
+    def X(self) -> float:
+        """计算等效电抗 (Ω)"""
+        return self.c_factor * self.Ur**2 / self.Sk / np.sqrt(1 + self.R_over_X**2)
+
+def build_entsoe_smib_system() -> ENTSOESMIBSystem:
+    """
+    构建 ENTSO-E SMIB 标准测试系统
+    
+    创建四节点测试系统，包含：
+    - 500 MVA 隐极同步发电机 + TGOV1 + SEXS + PSS2A
+    - 500 MVA 单元变压器 (21/419 kV, u_k=16%)
+    - 2500 MVA 无穷大母线与恒阻抗负荷
+    """
+    pass
+
+def run_test_case_1_voltage_step(system: ENTSOESMIBSystem) -> Dict:
+    """
+    测试案例 1：电压参考值阶跃 +0.05 p.u.
+    输出：U_NGEN(t), EFD(t) 时间序列
+    """
+    pass
+
+def run_test_case_2_load_step(system: ENTOESMIBSystem) -> Dict:
+    """
+    测试案例 2：负荷有功阶跃 +0.05 p.u.
+    输出：U_NGEN(t), PG(t), PMECH(t), QG(t), ω(t) 时间序列
+    """
+    pass
+
+def run_test_case_3_three_phase_fault(system: ENTSOESMIBSystem) -> Dict:
+    """
+    测试案例 3：NTHV 三相金属性短路 0.1s
+    输出：U_NGEN(t), EFD(t), PG(t), QG(t), ω(t), V_OTHSG(t), P_GRIDL(t), Q_GRIDL(t)
+    """
+    pass
+
+def compare_with_reference(
+    test_case: int,
+    results: Dict,
+    ref_results: Optional[Dict] = None
+) -> Dict:
+    """
+    与参考结果或不同参数配置对比，绘制对比曲线
+    支持：[有/无 PSS] 对比、[不同步长] 对比、[不同增益] 参数灵敏度分析
+    """
+    pass
+```
+
+**与现有模块的关联**
+- 复用 `models/generator.py` 的 `Generator` 类（需扩展 inertia 属性）
+- 复用 `network/ybus.py` 的网络结构
+- 新增 `models/governor.py`（TGOV1 传递函数与状态空间）
+- 新增 `models/exciter.py`（SEXS 模型）
+- 新增 `models/pss.py`（PSS2A 六阶模型）
+- 扩展 `stability/transient.py` 支持控制器输入
+- 新增 `stability/multi_machine_detailed.py` 支持完整模型链
+- 测试案例 3 的三相短路复用 `shortcircuit/symmetric.py` 的短路计算
+
+**优先级**：高  
+**预计难度**：中
+
+---
+
 ## 6. 电力系统规划与可靠性
 
 ### 6.1 发电系统可靠性
@@ -2010,6 +2513,7 @@ def demo_mtdc_power_sharing():
 | | 裕度计算 | 第六章 | **高** | 中 | 2-3 |
 | **高级稳定** | 低频振荡/PSS | 第七章 | **高** | 难 | 5-7 |
 | | 多机完整模型链 | 第七章 | **高** | 难 | 7-10 |
+| | **ENTSO-E SMIB测试系统** | ENTSO-E报告 | **高** | 中 | 3-5 |
 | | EEAC扩展 | 第八章 | 中 | 中 | 3-5 |
 | **规划可靠性** | 发电可靠性 | 第九章 | 中 | 中 | 3-4 |
 | | 输电可靠性 | 第九章 | 中 | 中 | 3-4 |
@@ -2033,7 +2537,8 @@ def demo_mtdc_power_sharing():
 6. 两端HVDC稳态模型 → 交直流混联潮流
 7. 低频振荡分析 → 小干扰稳定深度分析
 8. 多机完整模型链 → 含励磁/调速/PSS
-9. DFIG风电模型 → 新能源接入基础
+9. **ENTSO-E SMIB标准测试系统** → 控制器校验基准
+10. DFIG风电模型 → 新能源接入基础
 
 **第三阶段（3-4个月）—— 高级专题**
 10. 不良数据检测与辨识
@@ -2043,6 +2548,7 @@ def demo_mtdc_power_sharing():
 14. 电力市场（LMP计算）
 15. 发电/输电可靠性
 16. HVDC暂态/短路影响
+17. ENTSO-E 测试案例校验（含 PSS2A 参数整定）
 
 ### 10.3 目录结构（扩展后）
 
@@ -2109,6 +2615,7 @@ psa4teaching/
 │   ├── state_est_demo.py     # 新增：状态估计示例
 │   ├── voltage_stab_demo.py  # 新增：电压稳定示例
 │   ├── oscillation_demo.py   # 新增：低频振荡示例
+│   ├── entsoe_smib_demo.py  # 新增：ENTSO-E SMIB标准测试系统
 │   ├── facts_demo.py         # 新增：FACTS示例
 │   ├── hvdc_demo.py           # 新增：HVDC示例
 │   └── mtdc_demo.py           # 新增：MTDC示例
@@ -2133,10 +2640,11 @@ psa4teaching/
 2. **状态估计**：WLS估计、不良数据检测、冗余度分析
 3. **电压稳定**：PV曲线、灵敏度指标、模态分析、裕度计算
 4. **高级稳定**：低频振荡、PSS设计、多机完整模型、EEAC
-5. **规划可靠性**：发电/输电可靠性、N-1/N-2分析
-6. **电力市场**：经济调度、机组组合、LMP计算
-7. **FACTS/新能源**：SVC/STATCOM/TCSC、DFIG、光伏、储能
-8. **HVDC**：两端HVDC、多端直流(MTDC)、HVDC暂态/短路
+5. **ENTSO-E标准测试系统**：SMIB模型、TGOV1/SEXS/PSS2A控制器、三个标准化测试案例
+6. **规划可靠性**：发电/输电可靠性、N-1/N-2分析
+7. **电力市场**：经济调度、机组组合、LMP计算
+8. **FACTS/新能源**：SVC/STATCOM/TCSC、DFIG、光伏、储能
+9. **HVDC**：两端HVDC、多端直流(MTDC)、HVDC暂态/短路
 
 **教学价值**：
 - 为研究生提供从理论到实现的完整教学工具
