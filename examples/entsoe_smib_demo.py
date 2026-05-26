@@ -216,7 +216,7 @@ class SMIBState:
 # ============================================================
 
 def state_derivatives(state: SMIBState, system: Dict,
-                       V_ref: float, dt: float,
+                       V_ref: float, P_ref: float, dt: float,
                        X_ext: float, fault_active: bool,
                        is_no_load: bool = False) -> SMIBState:
     """计算系统状态导数
@@ -269,8 +269,10 @@ def state_derivatives(state: SMIBState, system: Dict,
     )
 
     # 3. 调速器
+    # P_ref 是功率参考值（稳态时 PMECH = P_ref）
+    # TGOV1 输入：u = P_ref - Δω/R
     Pm_ref, new_gov_state = gov.compute_rk4(
-        delta_omega, dt, state.gov_state
+        delta_omega, dt, state.gov_state, P_ref
     )
 
     # 4. 发电机导数
@@ -300,10 +302,10 @@ def state_derivatives(state: SMIBState, system: Dict,
 
 def rk4_integrate(state: SMIBState, system: Dict, dt: float,
                   V_ref: float, X_ext: float, fault_active: bool = False,
-                  is_no_load: bool = False) -> SMIBState:
+                  P_ref: float = 0.0, is_no_load: bool = False) -> SMIBState:
     """RK4积分一步"""
     def f_k(s):
-        return state_derivatives(s, system, V_ref, dt, X_ext, fault_active, is_no_load)
+        return state_derivatives(s, system, V_ref, P_ref, dt, X_ext, fault_active, is_no_load)
 
     k1 = f_k(state)
 
@@ -382,6 +384,7 @@ def run_test_case_1_voltage_step(system: Dict, dt: float = 0.001,
         'omega': np.zeros(n_steps),
         'delta': np.zeros(n_steps),
         'Pe': np.zeros(n_steps),
+        'Pm': np.zeros(n_steps),
     }
 
     for i in range(n_steps):
@@ -396,10 +399,11 @@ def run_test_case_1_voltage_step(system: Dict, dt: float = 0.001,
         results['omega'][i] = state.omega
         results['delta'][i] = np.degrees(state.delta)
         results['Pe'][i] = Pe
+        results['Pm'][i] = state.PMECH
 
-        state = rk4_integrate(state, system, dt, V_ref_arr[i],
-                               X_ext=0.0, is_no_load=True)
-
+        state = rk4_integrate(state, system, dt,\
+                        V_ref=V_ref_arr[i], P_ref=0.0,
+                        X_ext=0.0, is_no_load=True)
     print(f"  仿真完成: {n_steps} 步")
     return results
 
@@ -426,14 +430,18 @@ def run_test_case_2_load_step(system: Dict, dt: float = 0.001,
     P_load_0 = 0.76  # 380/500
 
     # 初始状态
-    # Eq' 需支持负荷：Pe = P_load_0
-    # 对于孤立系统，Vt = Eq' (空载基准)
-    # 有负荷时：Vt = Eq' - jXd'*I, I = P/Vt
-    # 近似：Eq' = sqrt(Vt² + (P*Xd')²) ≈ sqrt(1 + (0.76*0.35)²) ≈ 1.028
+    # TGOV1 稳态：Δω=0 时，PMECH = Ref(L) = PL_0 / P_base_MW
+    # Ref(L) 的单位是标幺值（以 P_base_MW 为基准）
+    P_ref_initial = P_load_0  # 0.76 pu (以 S_base=500 为基准）
+    # 但 TGOV1 的参数 R=0.05 是调速器调差，稳态时 PMECH = Ref(L) / (1 + Dt)
+    
     state = SMIBState()
     state.Eq_prime = 1.03
     state.Efd = 1.0
-    state.PMECH = P_load_0
+    state.PMECH = P_load_0  # 初始机械功率
+    
+    # 调速器初始状态：x1=0, x2=0, x3=P_load_0
+    state.gov_state = np.array([0.0, 0.0, P_load_0])
 
     results = {
         'time': np.linspace(0, t_end, n_steps),
@@ -480,9 +488,11 @@ def run_test_case_2_load_step(system: Dict, dt: float = 0.001,
         results['omega'][i] = state.omega
         results['delta'][i] = np.degrees(state.delta)
         results['Pm'][i] = state.PMECH
+        results['Pm'][i] = state.PMECH
         results['Pe'][i] = Pe
 
-        state = rk4_integrate(state, system, dt, 1.0,
+        state = rk4_integrate(state, system, dt,
+                               V_ref=1.0, P_ref=P_cur,
                                X_ext=0.0, is_no_load=(P_cur < 0.01))
 
     system['pss'].KS1 = original_KS1
@@ -525,6 +535,7 @@ def run_test_case_3_three_phase_fault(system: Dict, dt: float = 0.001,
         'omega': np.zeros(n_steps),
         'delta': np.zeros(n_steps),
         'Pe': np.zeros(n_steps),
+        'Pm': np.zeros(n_steps),
         'fault_active': np.zeros(n_steps, dtype=bool),
     }
 
@@ -544,9 +555,11 @@ def run_test_case_3_three_phase_fault(system: Dict, dt: float = 0.001,
         results['omega'][i] = state.omega
         results['delta'][i] = np.degrees(state.delta)
         results['Pe'][i] = Pe
+        results['Pm'][i] = state.PMECH
 
-        state = rk4_integrate(state, system, dt, 1.05,
-                               X_ext, fault_active)
+        state = rk4_integrate(state, system, dt,
+                               V_ref=1.05, P_ref=0.95,
+                               X_ext=X_ext, fault_active=fault_active)
 
     print(f"  仿真完成: {n_steps} 步")
     return results

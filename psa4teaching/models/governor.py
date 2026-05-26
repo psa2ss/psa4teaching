@@ -170,17 +170,19 @@ class TGOV1Params:
         # dx3/dt = (x2/T2 - x3) / T1 (简化)
 
         # 计算中间变量
-        u = delta_omega / self.R  # 输入信号
+        # 输入信号：u = P_ref - Δω/R（未包含死区）
+        # 注意：稳态时 Δω=0，P_mech = P_ref（限幅后）
+        u = P_ref - delta_omega / self.R  # 输入信号
 
         # 欧拉积分更新状态
         dx1 = (u - x1) / self.T1
         dx2 = (self.T2 * u - x2) / self.T3
-        dx3 = (x2 / self.T2 - x3)  # 直接跟踪
+        dx3 = (u - x3) / self.T1  # 输出跟踪，稳态时 x3 = u
 
         new_state = state + dt * np.array([dx1, dx2, dx3])
 
-        # 输出为 x3 (PMECH)，限制在 [VMIN, VMAX]
-        P_mech = np.clip(new_state[2], self.VMIN, self.VMAX)
+        # 输出 = x3 + Dt*Δω，限制在 [VMIN, VMAX]
+        P_mech = np.clip(new_state[2] + self.Dt * delta_omega, self.VMIN, self.VMAX)
 
         # 如果输出被限幅，调整状态
         if P_mech >= self.VMAX:
@@ -191,13 +193,15 @@ class TGOV1Params:
         return P_mech, new_state
 
     def compute_rk4(self, delta_omega: float, dt: float,
-                    state: Optional[np.ndarray] = None) -> Tuple[float, np.ndarray]:
+                     state: Optional[np.ndarray] = None,
+                     P_ref: float = 0.0) -> Tuple[float, np.ndarray]:
         """使用 RK4 方法计算 TGOV1 调速器输出
 
         Args:
             delta_omega: 转速偏差 Δω（标幺值）
             dt: 时间步长（秒）
             state: 当前状态向量 [x1, x2, x3]
+            P_ref: 功率参考值（标幺值，以汽轮机额定功率为基准）
 
         Returns:
             (P_mech, new_state): 机械功率输出和新状态
@@ -206,17 +210,17 @@ class TGOV1Params:
             state = np.zeros(3)
 
         def f(x, u):
-            """状态导数函数"""
+            """状态导数函数：输入 u = P_ref - Δω/R"""
             x1, x2, x3 = x
-            u_scaled = u / self.R
 
-            dx1 = (u_scaled - x1) / self.T1
-            dx2 = (self.T2 * u_scaled - x2) / self.T3
-            dx3 = (x2 / self.T2 - x3)
+            dx1 = (u - x1) / self.T1
+            dx2 = (self.T2 * u - x2) / self.T3
+            dx3 = (u - x3) / self.T1  # 稳态时 x3 = u
 
             return np.array([dx1, dx2, dx3])
 
-        u = delta_omega
+        # 输入信号：u = P_ref - delta_omega / self.R
+        u = P_ref - delta_omega / self.R
 
         # RK4 积分
         k1 = f(state, u)
