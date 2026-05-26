@@ -110,6 +110,9 @@ class Generator:
     # 机械参数
     H: float = 6.0                               # 惯性时间常数（秒）
     D: float = 0.0                               # 阻尼系数
+    TA: float = 8.0                               # 惯性时间常数含原动机（秒）
+    GD2: float = 162.114                         # 飞轮力矩（Mp·m²）
+    inertia: float = 40.528                      # 转动惯量（t·m²）
 
     # 模型类型
     model_type: GeneratorModelType = GeneratorModelType.CLASSIC
@@ -197,6 +200,17 @@ class Generator:
         """
         return self.H
 
+    def get_TA(self) -> float:
+        """获取含原动机的惯性时间常数
+
+        Returns:
+            TA（秒）
+
+        Note:
+            包含原动机在内的时间常数，用于详细动态仿真
+        """
+        return self.TA
+
     def get_damping_coefficient(self) -> float:
         """获取阻尼系数D
 
@@ -208,6 +222,19 @@ class Generator:
             典型值：0-2
         """
         return self.D
+
+    def get_mechanical_time_constants(self) -> dict:
+        """获取所有机械时间常数
+
+        Returns:
+            包含 H, TA, GD2, inertia 的字典
+        """
+        return {
+            'H': self.H,
+            'TA': self.TA,
+            'GD2': self.GD2,
+            'inertia': self.inertia
+        }
 
     def __repr__(self) -> str:
         return (f"Generator({self.name or 'G'}, bus={self.bus}, "

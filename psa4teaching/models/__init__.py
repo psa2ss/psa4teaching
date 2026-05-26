@@ -14,6 +14,9 @@ from psa4teaching.models.line import Line
 from psa4teaching.models.transformer import Transformer
 from psa4teaching.models.generator import Generator
 from psa4teaching.models.load import Load, LoadModel
+from psa4teaching.models.governor import TGOV1Params
+from psa4teaching.models.exciter import SEXSParams
+from psa4teaching.models.pss import PSS2AParams
 
 __all__ = [
     "Bus", "BusType",
@@ -21,4 +24,7 @@ __all__ = [
     "Transformer",
     "Generator",
     "Load", "LoadModel",
+    "TGOV1Params",
+    "SEXSParams",
+    "PSS2AParams",
 ]
