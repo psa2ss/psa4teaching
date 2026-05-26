@@ -1,94 +1,64 @@
 """
-ENTSO-E SMIB 标准测试系统演示
-===========================
+ENTSO-E SMIB 标准测试系统 - 动态仿真
+=============================================
 
-根据 ENTSO-E "Model Exchange for Power System Stability Studies" 报告
-实现 §5.4 标准测试系统（Single Machine Infinite Bus, SMIB）
+基于 ENTSO-E SG SPD 报告《Documentation on Controller Tests in Test Grid Configurations》
+实现的单机无穷大系统（SMIB）动态仿真。
 
-系统描述：
-    - 四节点系统：NGEN → NTLV → NTHV → NGRID
-    - 发电机通过变压器连接到 380kV 系统
-    - 无穷大母线作为参考
-    - 包含完整动态模型：发电机(5阶) + TGOV1调速器 + SEXS励磁系统 + PSS2A稳定器
-
-测试案例：
-    1. 电压参考值阶跃 +0.05 p.u. (t=0.1s)
-    2. 负荷有功阶跃 +0.05 p.u. (t=0.1s)
-    3. NTHV 三相短路故障 (t=0.1s, 持续0.1s)
+修正（v2）：
+1. 正确的 SMIB 网络方程：Vt = f(Eq', δ, X_ext)，不再是常量
+2. 正确的状态变量：δ, ω, Eq' 为发电机状态；Efd/PMECH 为控制器输出
+3. 正确的初始条件：空载时 Efd=1.0, PMECH=0
+4. 三测试案例使用不同的网络拓扑
 
 参考：
-    - ENTSO-E SG SPD Report, §5.4
-    - PSS/E Model Guide
-    - IEEE Standard 421.5-2016
+- ENTSO-E SG SPD Report (2013-11-26)
+- Kundur《Power System Stability and Control》
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict
+from typing import Dict, List, Optional, Tuple
 
 from psa4teaching.models import (
-    Bus, BusType, Line, Transformer, Generator, Load, LoadModel,
-    TGOV1Params, SEXSParams, PSS2AParams
+    Bus, BusType, Line, Transformer, Generator, Load, LoadModel
 )
+from psa4teaching.models.governor import TGOV1Params
+from psa4teaching.models.exciter import SEXSParams
+from psa4teaching.models.pss import PSS2AParams
 
 
 # ============================================================
 # 系统构建
 # ============================================================
 
-def build_entsoe_smib_system():
+def build_entsoe_smib_system() -> Dict:
     """构建 ENTSO-E SMIB 标准测试系统
 
-    Returns:
-        system: 包含 buses, lines, transformers, generators, loads,
-                 governors, exciters, pss 的字典
-
-    系统参数（来自 ENTSO-E 报告 §5.4）：
-        - 发电机：500 MVA, 21 kV, cosφ=0.95
-        - 变压器：500 MVA, 21/419 kV, uk=16%
-        - 无穷大系统：Sk=2500 MVA, Ur=380 kV, R/X=0.1
-        - 负荷：P=475 MW, Q=76 MVar（恒阻抗）
+    NGEN(21kV) ─ NTLV(21kV) ─ NTHV(380kV) ─ NGRID(380kV)
+        │                        │
+       GEN                      GRID(无穷大, Sk=2500MVA)
+                                 GRIDL(恒阻抗负荷)
     """
-    # 节点定义（基准电压21kV/380kV）
     buses = [
         Bus(1, "NGEN", BusType.PV, V_specified=1.0, base_kv=21.0),
         Bus(2, "NTLV", BusType.PQ, base_kv=21.0),
         Bus(3, "NTHV", BusType.PQ, base_kv=380.0),
-        Bus(4, "NGRID", BusType.SLACK, V_specified=1.0, base_kv=380.0),
+        Bus(4, "NGRID", BusType.SLACK, V_specified=1.05, base_kv=380.0),
     ]
 
-    # 线路（简化模型）
-    line1 = Line(
-        from_bus=1, to_bus=2,
-        R=0.001, X=0.01, B=0.0,
-        name="L1_NGEN_NTLV"
-    )
+    line1 = Line(from_bus=1, to_bus=2, R=0.001, X=0.01, B=0.0, name="L1_NGEN_NTLV")
+    line2 = Line(from_bus=3, to_bus=4, R=0.02, X=0.199, B=0.0, name="L2_NTHV_NGRID")
 
-    # NTHV - NGRID: 高压侧到无穷大系统
-    # 无穷大系统等效阻抗：Z = U²/Sk = 380²/2500 = 57.76 Ω
-    # R/X = 0.1, X = Z/√(1+0.1²) ≈ 57.7 Ω, R = 5.77 Ω
-    # 标幺值（基准500MVA, 380kV）：Z_base = 380²/500 = 288.8 Ω
-    # X_pu = 57.7/288.8 = 0.2, R_pu = 5.77/288.8 = 0.02
-    line2 = Line(
-        from_bus=3, to_bus=4,
-        R=0.02, X=0.2, B=0.0,
-        name="L2_NTHV_NGRID"
-    )
-
-    # 变压器 21/380 kV (uk=16%, 500 MVA)
-    # XT_pu = uk/100 * Vb²/Sb = 0.16 * 1.0²/1.0 = 0.16
-    # 考虑变比 21/419kV
     transformer = Transformer(
         from_bus=2, to_bus=3,
         RT=0.0, XT=0.16,
-        name="T1_GEN_GRID",
-        k=419.0/21.0
+        name="T1_GEN_GRID", k=419.0/21.0
     )
 
     lines = [line1, line2]
 
-    # 发电机（详细模型参数）
     generator = Generator(
         bus=1, name="GEN1",
         Sb=500.0, Vb=21.0,
@@ -96,24 +66,19 @@ def build_entsoe_smib_system():
         Xq=1.8, Xq_prime=0.5, Xq_doubleprime=0.3,
         Td0_prime=0.9, Td0_doubleprime=0.03,
         Tq0_prime=0.6, Tq0_doubleprime=0.05,
-        H=4.0, D=0.0,
-        model_type='detail',
+        H=4.0, D=0.0, model_type='detail',
     )
 
-    # 调速器 TGOV1
     governor = TGOV1Params(
         R=0.05, T1=0.5, T2=3.0, T3=10.0,
-        Dt=0.0, VMIN=0.0, VMAX=1.0,
-        P_base_MW=475.0
+        Dt=0.0, VMIN=0.0, VMAX=1.0, P_base_MW=475.0
     )
 
-    # 励磁系统 SEXS
     exciter = SEXSParams(
         K=200.0, TA=3.0, TB=10.0, TE=0.05,
         EMIN=0.0, EMAX=4.0
     )
 
-    # 电力系统稳定器 PSS2A
     pss = PSS2AParams(
         KS1=10.0, KS2=0.1564, KS3=1.0,
         TW1=2.0, TW2=2.0, TW3=2.0, TW4=0.0,
@@ -123,12 +88,10 @@ def build_entsoe_smib_system():
         N=0, M=0, IC1=1, IC2=3
     )
 
-    # 负荷（恒阻抗模型）
+    # 恒阻抗负荷 GRIDL
     load = Load(
-        bus=1,
-        P0=0.95, Q0=0.152,
-        model_type=LoadModel.CONSTANT_IMPEDANCE,
-        name="LOAD1"
+        bus=4, P0=475.0/500.0, Q0=76.0/500.0,
+        model_type=LoadModel.CONSTANT_IMPEDANCE, name="GRIDL"
     )
 
     return {
@@ -141,288 +104,449 @@ def build_entsoe_smib_system():
         'pss': pss,
         'load': load,
         'S_base': 500.0,
+        'f_base': 50.0,
     }
 
 
 # ============================================================
-# 动态仿真模型
+# 网络方程
+# ============================================================
+
+def compute_smib_voltages(delta: float, Eq_prime: float, gen: Generator,
+                          X_ext: float = 0.0, fault_active: bool = False,
+                          V_inf_mag: float = 1.0, is_no_load: bool = False) -> Tuple[float, float, float]:
+    """SMIB 网络方程：从发电机内部状态计算端电压和电磁功率
+
+    单机无穷大（SMIB）等效电路：
+        Eq'∠δ — jXd' — Vt∠θ — jX_ext — V_inf∠0°
+
+    电流：I = (Eq'∠δ - V_inf∠0°) / j(Xd' + X_ext)
+    端电压：Vt = Eq'∠δ - jXd' * I
+    电磁功率：Pe = (Eq' * V_inf / X_total) * sin(δ)
+
+    Args:
+        delta: 转子角（弧度）
+        Eq_prime: 暂态电势（标幺值）
+        gen: Generator 对象
+        X_ext: 外部等效电抗（标幺值）
+        fault_active: 是否发生故障
+        V_inf_mag: 无穷大母线电压（标幺值）
+        is_no_load: 空载模式
+
+    Returns:
+        (Vt_mag, Pe, I_mag): 端电压幅值，电磁功率，电流幅值
+    """
+    Xd_prime = gen.Xd_prime
+
+    if is_no_load:
+        # 空载：无电流，Vt = Eq'
+        return abs(Eq_prime), 0.0, 0.0
+
+    X_total = Xd_prime + max(X_ext, 1e-10)
+
+    if fault_active:
+        # 故障时：Vt 降为接近 0
+        # 实际计算：I = Eq'/jXd_prime (短路到发电机端)
+        # Pe = 0 (无功率输出)
+        I_fault = Eq_prime / Xd_prime
+        return 0.05, 0.0, I_fault
+
+    # 正常工况
+    Vt_mag = np.sqrt(
+        (V_inf_mag * Xd_prime / X_total * np.cos(delta))**2 +
+        (Eq_prime - V_inf_mag * Xd_prime / X_total * np.cos(delta))**2
+    )
+    Pe = (Eq_prime * V_inf_mag / X_total) * np.sin(delta)
+
+    return Vt_mag, Pe, 0.0
+
+
+def get_external_reactance(system: Dict, fault_active: bool = False) -> float:
+    """计算 SMIB 系统外部等值电抗
+
+    正常：X_ext = X_line1 + X_T1 + X_line2
+    故障：X_ext = X_line1 + X_T1 (到 NTHV 故障点)
+
+    Returns:
+        外部电抗（标幺值）
+    """
+    lines = system['lines']
+    tx = system['transformers'][0]
+    X_normal = lines[0].X + tx.XT + lines[1].X
+
+    if fault_active:
+        return lines[0].X + tx.XT
+    return X_normal
+
+
+# ============================================================
+# 状态变量
 # ============================================================
 
 @dataclass
-class DynamicState:
-    """动态仿真状态向量
+class SMIBState:
+    """SMIB 系统完整状态（发电机3维 + 控制器12维）
 
-    状态变量（约10维）：
-        - delta: 转子角（弧度）
-        - omega: 转子转速（标幺值）
-        - Eq_prime: d轴暂态电势
-        - Efd: 励磁电压
-        - PMECH: 机械功率（标幺值）
-        - exc_state: 励磁系统状态（3维）
-        - gov_state: 调速器状态（3维）
-        - pss_state: PSS状态（6维）
+    发电机状态（3维）:
+        delta: 转子功角（弧度）
+        omega: 转速（标幺值）
+        Eq_prime: d轴暂态电势（标幺值）
+
+    控制器内部状态:
+        exc_state[3]: 励磁系统（SEXS，3阶）
+        gov_state[3]: 调速器（TGOV1，3阶）
+        pss_state[6]: 稳定器（PSS2A，6阶）
+
+    控制器输出（工作变量）:
+        Efd: 励磁电压（标幺值）
+        PMECH: 机械功率（标幺值）
     """
     delta: float = 0.0
     omega: float = 1.0
     Eq_prime: float = 1.0
-    Efd: float = 2.0
-    PMECH: float = 0.95
     exc_state: np.ndarray = field(default_factory=lambda: np.zeros(3))
     gov_state: np.ndarray = field(default_factory=lambda: np.zeros(3))
     pss_state: np.ndarray = field(default_factory=lambda: np.zeros(6))
+    Efd: float = 1.0
+    PMECH: float = 0.0
 
 
-def system_derivatives(state: DynamicState, system: dict,
-                       V_terminal: complex, V_ref: float) -> DynamicState:
+# ============================================================
+# 状态导数与 RK4
+# ============================================================
+
+def state_derivatives(state: SMIBState, system: Dict,
+                       V_ref: float, dt: float,
+                       X_ext: float, fault_active: bool,
+                       is_no_load: bool = False) -> SMIBState:
     """计算系统状态导数
 
-    包含：发电机(5阶) + 励磁系统(3阶) + 调速器(3阶) + PSS(6阶)
+    发电机方程:
+        dδ/dt = (ω - 1.0) * ω_base
+        dω/dt = (Pm - Pe - D*Δω) / (2H)
+        dEq'/dt = (Efd - Eq') / Td0'
+
+    Args:
+        state: 当前状态
+        system: 系统参数
+        V_ref: 电压参考值
+        dt: 时间步长
+        X_ext: 外部等值电抗
+        fault_active: 是否故障
+        is_no_load: 是否空载
+
+    Returns:
+        SMIBState: 状态导数（Efd/PMECH 存储控制器输出用于记录）
     """
     gen = system['generator']
     gov = system['governor']
     exc = system['exciter']
-    pss = system['pss']
+    pss_model = system['pss']
+    f_base = system['f_base']
+
+    # 计算端电压和电磁功率
+    Vt_mag, Pe, _ = compute_smib_voltages(
+        state.delta, state.Eq_prime, gen, X_ext,
+        fault_active, is_no_load=is_no_load
+    )
 
     delta_omega = state.omega - 1.0
 
-    # PSS输出
-    V_S, _ = pss.compute_stabilizing_signal_rk4(
-        delta_omega, state.PMECH, 0.01, state.pss_state
+    # 1. PSS
+    pss_reset = is_no_load  # 空载/隔离运行关掉PSS
+    if pss_reset:
+        V_S = 0.0
+        new_pss_state = state.pss_state.copy()
+    else:
+        V_S, new_pss_state = pss_model.compute_stabilizing_signal_rk4(
+            delta_omega, state.PMECH, dt, state.pss_state
+        )
+
+    # 2. 励磁系统
+    # SEXS compute(V_ref, V_measured, V_S, dt, state)
+    Efd, new_exc_state = exc.compute_rk4(
+        V_ref, Vt_mag, V_S, dt, state.exc_state
     )
 
-    # 励磁系统
-    Efd, _ = exc.compute_rk4(
-        V_ref, abs(V_terminal), V_S, 0.01, state.exc_state
+    # 3. 调速器
+    Pm_ref, new_gov_state = gov.compute_rk4(
+        delta_omega, dt, state.gov_state
     )
 
-    # 调速器输出
-    PMECH_gov, _ = gov.compute_rk4(
-        delta_omega, 0.01, state.gov_state
-    )
+    # 4. 发电机导数
+    omega_base = 2 * np.pi * f_base
 
-    # === 发电机部分 ===
-    H = gen.H
-    D = gen.D
-    Xd_prime = gen.Xd_prime
-    Xq = gen.Xq
-    Td0_prime = gen.Td0_prime
+    d_delta = delta_omega * omega_base
+    d_omega = (Pm_ref - Pe - gen.D * delta_omega) / (2 * gen.H)
+    d_Eq_prime = (Efd - state.Eq_prime) / gen.Td0_prime
 
-    # 端电压 dq 分解
-    delta = state.delta
-    Vd = V_terminal.imag * np.cos(delta) - V_terminal.real * np.sin(delta)
-    Vq = V_terminal.real * np.cos(delta) + V_terminal.imag * np.sin(delta)
+    # 控制器导数（差分近似）
+    d_exc = (new_exc_state - state.exc_state) / dt
+    d_gov = (new_gov_state - state.gov_state) / dt
+    d_pss = (new_pss_state - state.pss_state) / dt
 
-    # 电流计算
-    Id = (state.Eq_prime - Vq) / Xd_prime
-    Iq = Vd / Xq
+    deriv = SMIBState()
+    deriv.delta = d_delta
+    deriv.omega = d_omega
+    deriv.Eq_prime = d_Eq_prime
+    deriv.exc_state = d_exc
+    deriv.gov_state = d_gov
+    deriv.pss_state = d_pss
+    deriv.Efd = Efd
+    deriv.PMECH = Pm_ref
 
-    # 电磁功率
-    Pe = Vd * Id + Vq * Iq
-
-    # 转子运动方程 (dδ/dt 转换为 rad/s)
-    omega_s = 2 * np.pi * 50
-    d_delta = (state.omega - 1.0) * omega_s
-    d_omega = (PMECH_gov - Pe - D * delta_omega) / (2 * H)
-
-    # 暂态电势方程
-    d_Eq_prime = (Efd - state.Eq_prime) / Td0_prime
-
-    # 控制器导数（使用差分近似）
-    d_Efd = (Efd - state.Efd) / 0.01
-    d_PMECH = (PMECH_gov - state.PMECH) / 0.01
-
-    # 控制器状态导数（使用差分近似）
-    d_exc = np.zeros(3)
-    d_gov = np.zeros(3)
-    d_pss = np.zeros(6)
-
-    return DynamicState(
-        delta=d_delta, omega=d_omega,
-        Eq_prime=d_Eq_prime, Efd=d_Efd, PMECH=d_PMECH,
-        exc_state=d_exc, gov_state=d_gov, pss_state=d_pss
-    )
+    return deriv
 
 
-def rk4_step(state: DynamicState, system: dict, dt: float,
-             V_ref: float = 1.0, V_terminal: complex = 1.0+0j) -> DynamicState:
-    """RK4 积分一步"""
-    f = lambda s: system_derivatives(s, system, V_terminal, V_ref)
+def rk4_integrate(state: SMIBState, system: Dict, dt: float,
+                  V_ref: float, X_ext: float, fault_active: bool = False,
+                  is_no_load: bool = False) -> SMIBState:
+    """RK4积分一步"""
+    def f_k(s):
+        return state_derivatives(s, system, V_ref, dt, X_ext, fault_active, is_no_load)
 
-    k1 = f(state)
+    k1 = f_k(state)
 
-    s2 = DynamicState(
-        delta=state.delta + dt/2*k1.delta,
-        omega=state.omega + dt/2*k1.omega,
-        Eq_prime=state.Eq_prime + dt/2*k1.Eq_prime,
-        Efd=state.Efd + dt/2*k1.Efd,
-        PMECH=state.PMECH + dt/2*k1.PMECH,
-        exc_state=state.exc_state + dt/2*k1.exc_state,
-        gov_state=state.gov_state + dt/2*k1.gov_state,
-        pss_state=state.pss_state + dt/2*k1.pss_state,
-    )
-    k2 = f(s2)
+    s2 = SMIBState(delta=state.delta + dt/2*k1.delta,
+                   omega=state.omega + dt/2*k1.omega,
+                   Eq_prime=state.Eq_prime + dt/2*k1.Eq_prime,
+                   exc_state=state.exc_state + dt/2*k1.exc_state,
+                   gov_state=state.gov_state + dt/2*k1.gov_state,
+                   pss_state=state.pss_state + dt/2*k1.pss_state)
+    k2 = f_k(s2)
 
-    s3 = DynamicState(
-        delta=state.delta + dt/2*k2.delta,
-        omega=state.omega + dt/2*k2.omega,
-        Eq_prime=state.Eq_prime + dt/2*k2.Eq_prime,
-        Efd=state.Efd + dt/2*k2.Efd,
-        PMECH=state.PMECH + dt/2*k2.PMECH,
-        exc_state=state.exc_state + dt/2*k2.exc_state,
-        gov_state=state.gov_state + dt/2*k2.gov_state,
-        pss_state=state.pss_state + dt/2*k2.pss_state,
-    )
-    k3 = f(s3)
+    s3 = SMIBState(delta=state.delta + dt/2*k2.delta,
+                   omega=state.omega + dt/2*k2.omega,
+                   Eq_prime=state.Eq_prime + dt/2*k2.Eq_prime,
+                   exc_state=state.exc_state + dt/2*k2.exc_state,
+                   gov_state=state.gov_state + dt/2*k2.gov_state,
+                   pss_state=state.pss_state + dt/2*k2.pss_state)
+    k3 = f_k(s3)
 
-    s4 = DynamicState(
-        delta=state.delta + dt*k3.delta,
-        omega=state.omega + dt*k3.omega,
-        Eq_prime=state.Eq_prime + dt*k3.Eq_prime,
-        Efd=state.Efd + dt*k3.Efd,
-        PMECH=state.PMECH + dt*k3.PMECH,
-        exc_state=state.exc_state + dt*k3.exc_state,
-        gov_state=state.gov_state + dt*k3.gov_state,
-        pss_state=state.pss_state + dt*k3.pss_state,
-    )
-    k4 = f(s4)
+    s4 = SMIBState(delta=state.delta + dt*k3.delta,
+                   omega=state.omega + dt*k3.omega,
+                   Eq_prime=state.Eq_prime + dt*k3.Eq_prime,
+                   exc_state=state.exc_state + dt*k3.exc_state,
+                   gov_state=state.gov_state + dt*k3.gov_state,
+                   pss_state=state.pss_state + dt*k3.pss_state)
+    k4 = f_k(s4)
 
-    return DynamicState(
-        delta=state.delta + dt/6*(k1.delta+2*k2.delta+2*k3.delta+k4.delta),
-        omega=state.omega + dt/6*(k1.omega+2*k2.omega+2*k3.omega+k4.omega),
-        Eq_prime=state.Eq_prime + dt/6*(k1.Eq_prime+2*k2.Eq_prime+2*k3.Eq_prime+k4.Eq_prime),
-        Efd=state.Efd + dt/6*(k1.Efd+2*k2.Efd+2*k3.Efd+k4.Efd),
-        PMECH=state.PMECH + dt/6*(k1.PMECH+2*k2.PMECH+2*k3.PMECH+k4.PMECH),
-        exc_state=state.exc_state + dt/6*(k1.exc_state+2*k2.exc_state+2*k3.exc_state+k4.exc_state),
-        gov_state=state.gov_state + dt/6*(k1.gov_state+2*k2.gov_state+2*k3.gov_state+k4.gov_state),
-        pss_state=state.pss_state + dt/6*(k1.pss_state+2*k2.pss_state+2*k3.pss_state+k4.pss_state),
-    )
+    s_new = SMIBState()
+    s_new.delta = state.delta + dt/6*(k1.delta+2*k2.delta+2*k3.delta+k4.delta)
+    s_new.omega = state.omega + dt/6*(k1.omega+2*k2.omega+2*k3.omega+k4.omega)
+    s_new.Eq_prime = state.Eq_prime + dt/6*(k1.Eq_prime+2*k2.Eq_prime+2*k3.Eq_prime+k4.Eq_prime)
+    s_new.exc_state = state.exc_state + dt/6*(k1.exc_state+2*k2.exc_state+2*k3.exc_state+k4.exc_state)
+    s_new.gov_state = state.gov_state + dt/6*(k1.gov_state+2*k2.gov_state+2*k3.gov_state+k4.gov_state)
+    s_new.pss_state = state.pss_state + dt/6*(k1.pss_state+2*k2.pss_state+2*k3.pss_state+k4.pss_state)
+    s_new.Efd = 0  # 使用 k4 作为最终值
+    s_new.PMECH = 0
+    # 用 k4 的输出值
+    s_new.Efd = k4.Efd
+    s_new.PMECH = k4.PMECH
+
+    return s_new
 
 
 # ============================================================
-# 测试案例
+# 测试案例 1: 电压参考值阶跃（空载）
 # ============================================================
+# 配置：S-GEN 断开，发电机孤立运行，无负荷
+# 初始：Vt = 1.0, Efd = 1.0（忽略饱和）
+# 事件：t=0.1s, V_ref: 1.0 → 1.05
+# 仿真时长：2s, 步长 1ms
+# 输出：U_NGEN(t), EFD(t)
 
-def run_test_case_1_voltage_step(system: dict, dt: float = 0.001,
-                                  t_end: float = 2.0) -> dict:
-    """测试案例1：电压参考值阶跃 +0.05 p.u.
-
-    事件：t=0.1s: V_ref 从 1.0 阶跃到 1.05
-    """
+def run_test_case_1_voltage_step(system: Dict, dt: float = 0.001,
+                                    t_end: float = 2.0) -> Dict:
+    """测试案例 1：电压参考值阶跃"""
     print("运行测试案例 1: 电压参考值阶跃 +0.05 p.u.")
 
     n_steps = int(t_end / dt)
     event_idx = int(0.1 / dt)
 
+    # V_ref: 空载 1.0, t=0.1s 阶跃到 1.05
     V_ref_arr = np.ones(n_steps)
     V_ref_arr[event_idx:] = 1.05
 
-    state = DynamicState()
+    # 初始状态：空载，Efd=1.0, PMECH=0
+    state = SMIBState()
+    state.Eq_prime = 1.0
+    state.Efd = 1.0
+    state.PMECH = 0.0
 
     results = {
         'time': np.linspace(0, t_end, n_steps),
         'V_ref': V_ref_arr.copy(),
+        'Vt': np.zeros(n_steps),
+        'Efd': np.zeros(n_steps),
         'omega': np.zeros(n_steps),
         'delta': np.zeros(n_steps),
-        'Efd': np.zeros(n_steps),
-        'PMECH': np.zeros(n_steps),
-        'V_terminal': np.zeros(n_steps),
+        'Pe': np.zeros(n_steps),
     }
 
-    Vt = 1.0 + 0j
     for i in range(n_steps):
-        results['omega'][i] = state.omega
-        results['delta'][i] = state.delta
-        results['Efd'][i] = state.Efd
-        results['PMECH'][i] = state.PMECH
-        results['V_terminal'][i] = abs(Vt)
+        # 空载：Vt = Eq'
+        Vt_mag, Pe, _ = compute_smib_voltages(
+            state.delta, state.Eq_prime, system['generator'],
+            0.0, is_no_load=True
+        )
 
-        state = rk4_step(state, system, dt, V_ref_arr[i], Vt)
+        results['Vt'][i] = Vt_mag
+        results['Efd'][i] = state.Efd
+        results['omega'][i] = state.omega
+        results['delta'][i] = np.degrees(state.delta)
+        results['Pe'][i] = Pe
+
+        state = rk4_integrate(state, system, dt, V_ref_arr[i],
+                               X_ext=0.0, is_no_load=True)
 
     print(f"  仿真完成: {n_steps} 步")
     return results
 
 
-def run_test_case_2_load_step(system: dict, dt: float = 0.001,
-                               t_end: float = 15.0) -> dict:
-    """测试案例2：负荷有功阶跃 +0.05 p.u.
+# ============================================================
+# 测试案例 2: 负荷有功阶跃（隔离运行）
+# ============================================================
+# 配置：S-GEN 断开，NGEN 节点有附加恒阻抗负荷
+# 初始：PL = 0.8 * S_r,G * cosφ_r = 380 MW
+# 事件：t=0.1s, PL 增加 +0.05 pu
+# PSS 必须关断
+# 仿真时长：15s
+# 输出：U_NGEN, PG, PMECH, QG, ω
 
-    事件：t=0.1s: 负荷有功从 0.95 到 1.0 p.u.
-    """
+def run_test_case_2_load_step(system: Dict, dt: float = 0.001,
+                                 t_end: float = 15.0) -> Dict:
+    """测试案例 2：负荷有功阶跃"""
     print("运行测试案例 2: 负荷有功阶跃 +0.05 p.u.")
 
     n_steps = int(t_end / dt)
     event_idx = int(0.1 / dt)
 
-    state = DynamicState()
+    # 负荷功率（标幺值）
+    P_load_0 = 0.76  # 380/500
+
+    # 初始状态
+    # Eq' 需支持负荷：Pe = P_load_0
+    # 对于孤立系统，Vt = Eq' (空载基准)
+    # 有负荷时：Vt = Eq' - jXd'*I, I = P/Vt
+    # 近似：Eq' = sqrt(Vt² + (P*Xd')²) ≈ sqrt(1 + (0.76*0.35)²) ≈ 1.028
+    state = SMIBState()
+    state.Eq_prime = 1.03
+    state.Efd = 1.0
+    state.PMECH = P_load_0
 
     results = {
         'time': np.linspace(0, t_end, n_steps),
+        'Vt': np.zeros(n_steps),
+        'Efd': np.zeros(n_steps),
         'omega': np.zeros(n_steps),
         'delta': np.zeros(n_steps),
-        'Efd': np.zeros(n_steps),
-        'PMECH': np.zeros(n_steps),
-        'V_terminal': np.zeros(n_steps),
-        'P_gen': np.zeros(n_steps),
-        'Q_gen': np.zeros(n_steps),
-        'P_load': np.ones(n_steps) * 0.95,
+        'Pm': np.zeros(n_steps),
+        'Pe': np.zeros(n_steps),
     }
-    results['P_load'][event_idx:] = 1.0
 
-    Vt = 1.0 + 0j
+    # 关掉 PSS
+    original_KS1 = system['pss'].KS1
+    system['pss'].KS1 = 0.0
+    print("  PSS 已关闭 (KS1=0)")
+
+    # 负荷等效 X_ext（近似为纯有功负荷）
+    # 恒阻抗：Z_load = V²/P = 1/0.76 = 1.316 pu
+    # X_ext 不直接适用，用 no_load=False, X_ext=0 但 V_inf_mag=0
+
     for i in range(n_steps):
-        results['omega'][i] = state.omega
-        results['delta'][i] = state.delta
+        is_step = (i >= event_idx)
+        P_cur = P_load_0 + (0.05 if is_step else 0.0)
+
+        # 计算端电压
+        # 简化：孤立系统接恒阻抗负荷
+        # I = Pe / Vt  (近似)
+        # 用迭代法或直接公式
+        Vt_mag, Pe, _ = compute_smib_voltages(
+            state.delta, state.Eq_prime, system['generator'],
+            0.0, is_no_load=(P_cur < 0.01)  # 近似空载
+        )
+        # 当有负荷时，修正端电压：
+        # Vt 会因负荷电流而下降
+        if P_cur > 0.01:
+            Xd_prime = system['generator'].Xd_prime
+            Z_load = 1.0 / P_cur  # 近似
+            load_factor = 1.0 / np.sqrt(1 + ((Xd_prime * P_cur))**2)
+            Vt_mag_adjusted = state.Eq_prime * Z_load / np.sqrt(Xd_prime**2 + Z_load**2)
+            Vt_mag = min(Vt_mag, Vt_mag_adjusted)
+
+        results['Vt'][i] = Vt_mag
         results['Efd'][i] = state.Efd
-        results['PMECH'][i] = state.PMECH
-        results['V_terminal'][i] = abs(Vt)
+        results['omega'][i] = state.omega
+        results['delta'][i] = np.degrees(state.delta)
+        results['Pm'][i] = state.PMECH
+        results['Pe'][i] = Pe
 
-        state = rk4_step(state, system, dt, 1.0, Vt)
+        state = rk4_integrate(state, system, dt, 1.0,
+                               X_ext=0.0, is_no_load=(P_cur < 0.01))
 
+    system['pss'].KS1 = original_KS1
     print(f"  仿真完成: {n_steps} 步")
     return results
 
 
-def run_test_case_3_three_phase_fault(system: dict, dt: float = 0.001,
-                                       t_end: float = 10.0,
-                                       fault_duration: float = 0.1) -> dict:
-    """测试案例3：NTHV 三相短路故障
+# ============================================================
+# 测试案例 3: 三相短路（全控运行）
+# ============================================================
+# 配置：基准潮流工况，全部控制器投入
+# 事件：t=0.1s, NTHV 三相短路
+#       t=0.2s, 故障清除
+# 仿真时长：10s
+# 输出：U_NGEN, EFD, PG, QG, ω, VOTHSG
 
-    事件：
-        t=0.1s: NTHV 三相短路
-        t=0.2s: 故障清除
-    """
+def run_test_case_3_three_phase_fault(system: Dict, dt: float = 0.001,
+                                          t_end: float = 10.0,
+                                          fault_duration: float = 0.1) -> Dict:
+    """测试案例 3：NTHV 三相短路"""
     print(f"运行测试案例 3: NTHV 三相短路 ({fault_duration}s)")
 
     n_steps = int(t_end / dt)
     fault_start = int(0.1 / dt)
     fault_clear = int((0.1 + fault_duration) / dt)
 
-    state = DynamicState()
+    # 初始状态（基准潮流工况）
+    # PG = 475 MW = 0.95 pu
+    # V_inf = 1.05 pu, δ 约 30-40°
+    state = SMIBState()
+    state.delta = np.radians(35.0)
+    state.Eq_prime = 1.1
+    state.Efd = 1.0
+    state.PMECH = 0.95
 
     results = {
         'time': np.linspace(0, t_end, n_steps),
+        'Vt': np.zeros(n_steps),
+        'Efd': np.zeros(n_steps),
         'omega': np.zeros(n_steps),
         'delta': np.zeros(n_steps),
-        'Efd': np.zeros(n_steps),
-        'PMECH': np.zeros(n_steps),
-        'V_terminal': np.zeros(n_steps),
+        'Pe': np.zeros(n_steps),
         'fault_active': np.zeros(n_steps, dtype=bool),
     }
 
     for i in range(n_steps):
-        results['omega'][i] = state.omega
-        results['delta'][i] = state.delta
+        fault_active = (fault_start <= i < fault_clear)
+        X_ext = get_external_reactance(system, fault_active)
+
+        results['fault_active'][i] = fault_active
+
+        Vt_mag, Pe, _ = compute_smib_voltages(
+            state.delta, state.Eq_prime, system['generator'],
+            X_ext, fault_active, V_inf_mag=1.05
+        )
+
+        results['Vt'][i] = Vt_mag
         results['Efd'][i] = state.Efd
-        results['PMECH'][i] = state.PMECH
+        results['omega'][i] = state.omega
+        results['delta'][i] = np.degrees(state.delta)
+        results['Pe'][i] = Pe
 
-        if fault_start <= i < fault_clear:
-            results['fault_active'][i] = True
-            Vt = complex(0.0, 0.0)  # 短路时电压近似为0
-        else:
-            Vt = complex(1.0, 0.0)
-
-        results['V_terminal'][i] = abs(Vt)
-        state = rk4_step(state, system, dt, 1.0, Vt)
+        state = rk4_integrate(state, system, dt, 1.05,
+                               X_ext, fault_active)
 
     print(f"  仿真完成: {n_steps} 步")
     return results
@@ -432,149 +556,99 @@ def run_test_case_3_three_phase_fault(system: dict, dt: float = 0.001,
 # 绘图
 # ============================================================
 
-def plot_test_case_results(case_num: int, results: dict):
+def plot_test_case_results(case_num: int, results: Dict):
     """绘制测试案例结果"""
     time = results['time']
 
     if case_num == 1:
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        fig.suptitle('测试案例 1: 电压参考值阶跃 +0.05 p.u.', fontsize=14)
+        fig.suptitle('Test Case 1: Voltage Reference Step +0.05 pu', fontsize=14)
 
         ax = axes[0, 0]
-        ax.plot(time, results['V_ref'], 'b-', label='V_ref', linewidth=2)
-        ax.plot(time, results['V_terminal'], 'r--', label='V_NGEN', linewidth=1.5)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('电压 (p.u.)')
-        ax.set_title('电压参考值与端电压'); ax.legend(); ax.grid(True)
+        ax.plot(time, results['V_ref'], 'b-', label='V_ref', lw=2)
+        ax.plot(time, results['Vt'], 'r--', label='V_NGEN', lw=1.5)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Voltage (pu)')
+        ax.set_title('Terminal Voltage'); ax.legend(); ax.grid(True)
 
         ax = axes[0, 1]
-        ax.plot(time, results['Efd'], 'g-', linewidth=2)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('EFD (p.u.)')
-        ax.set_title('励磁电压 EFD'); ax.grid(True)
+        ax.plot(time, results['Efd'], 'g-', lw=1.5)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Efd (pu)')
+        ax.set_title('Excitation Voltage'); ax.grid(True)
 
         ax = axes[1, 0]
-        ax.plot(time, (results['omega']-1)*50, 'm-', linewidth=1.5)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('Δf (Hz)')
-        ax.set_title('转速偏差'); ax.grid(True)
+        ax.plot(time, results['omega'], 'm-', lw=1.5)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Speed (pu)')
+        ax.set_title('Rotor Speed'); ax.grid(True)
 
         ax = axes[1, 1]
-        ax.plot(time, results['PMECH'], 'c-', linewidth=1.5)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('PMECH (p.u.)')
-        ax.set_title('机械功率 PMECH'); ax.grid(True)
+        ax.plot(time, results['Pe'], 'c-', lw=1.5)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Pe (pu)')
+        ax.set_title('Electrical Power'); ax.grid(True)
 
-        plt.tight_layout()
+        plt.tight_layout(); plt.show()
 
     elif case_num == 2:
-        fig, axes = plt.subplots(3, 2, figsize=(12, 10))
-        fig.suptitle('测试案例 2: 负荷有功阶跃 +0.05 p.u.', fontsize=14)
+        fig, axes = plt.subplots(3, 2, figsize=(14, 10))
+        fig.suptitle('Test Case 2: Load Step +0.05 pu', fontsize=14)
 
-        ax = axes[0, 0]
-        ax.plot(time, results['V_terminal'], 'r-', linewidth=2)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('V_NGEN (p.u.)')
-        ax.set_title('端电压 V_NGEN'); ax.grid(True)
+        axes[0, 0].plot(time, results['Vt'], 'r-', label='V_NGEN')
+        axes[0, 0].set_title('Terminal Voltage'); axes[0, 0].grid(True)
 
-        ax = axes[0, 1]
-        ax.plot(time, results['P_gen'], 'b-', label='P_G', linewidth=1.5)
-        ax.plot(time, results['P_load'], 'r--', label='P_load', linewidth=1.5)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('功率 (p.u.)')
-        ax.set_title('有功功率'); ax.legend(); ax.grid(True)
+        axes[0, 1].plot(time, results['Pm'], 'b-', label='P_MECH')
+        axes[0, 1].set_title('Mechanical Power'); axes[0, 1].grid(True)
 
-        ax = axes[1, 0]
-        ax.plot(time, results['PMECH'], 'g-', linewidth=1.5)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('PMECH (p.u.)')
-        ax.set_title('机械功率 PMECH'); ax.grid(True)
+        axes[1, 0].plot(time, results['omega'], 'm-', label='Speed')
+        axes[1, 0].set_title('Rotor Speed'); axes[1, 0].grid(True)
 
-        ax = axes[1, 1]
-        ax.plot(time, results['Q_gen'], 'c-', linewidth=1.5)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('Q_G (p.u.)')
-        ax.set_title('无功功率 Q_G'); ax.grid(True)
+        axes[1, 1].plot(time, results['Pe'], 'g-', label='P_ELEC')
+        axes[1, 1].set_title('Electrical Power'); axes[1, 1].grid(True)
 
-        ax = axes[2, 0]
-        ax.plot(time, results['omega'], 'm-', linewidth=1.5)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('ω_G (p.u.)')
-        ax.set_title('转速 ω_G'); ax.grid(True)
+        axes[2, 0].plot(time, results['Efd'], 'c-', label='Efd')
+        axes[2, 0].set_title('Excitation Voltage'); axes[2, 0].grid(True)
 
-        ax = axes[2, 1]
-        ax.plot(time, results['Efd'], 'y-', linewidth=1.5)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('EFD (p.u.)')
-        ax.set_title('励磁电压 EFD'); ax.grid(True)
+        axes[2, 1].plot(time, results['delta'], 'y-', label='Angle')
+        axes[2, 1].set_title('Rotor Angle'); axes[2, 1].grid(True)
 
-        plt.tight_layout()
+        plt.tight_layout(); plt.show()
 
     elif case_num == 3:
-        fig, axes = plt.subplots(3, 2, figsize=(12, 10))
-        fig.suptitle('测试案例 3: NTHV 三相短路故障', fontsize=14)
-
-        fault_idx = results['fault_active']
+        fig, axes = plt.subplots(3, 2, figsize=(14, 10))
+        fig.suptitle('Test Case 3: Three-Phase Short Circuit', fontsize=14)
 
         ax = axes[0, 0]
-        ax.plot(time, results['V_terminal'], 'r-', linewidth=2)
-        if np.any(fault_idx):
-            ft = time[fault_idx]
-            ax.axvspan(ft[0], ft[-1], alpha=0.3, color='red', label='故障')
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('V_NGEN (p.u.)')
-        ax.set_title('端电压 V_NGEN'); ax.legend(); ax.grid(True)
+        ax.plot(time, results['Vt'], 'r-', label='V_NGEN', lw=1.5)
+        ax.plot(time, results['fault_active'].astype(float)*0.5, 'k--', alpha=0.3, label='Fault')
+        ax.set_title('Terminal Voltage'); ax.legend(); ax.grid(True)
 
-        ax = axes[0, 1]
-        ax.plot(time, results['Efd'], 'g-', linewidth=1.5)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('EFD (p.u.)')
-        ax.set_title('励磁电压 EFD'); ax.grid(True)
+        axes[0, 1].plot(time, results['Efd'], 'c-', label='Efd', lw=1.5)
+        axes[0, 1].set_title('Excitation Voltage'); axes[0, 1].grid(True)
 
-        ax = axes[1, 0]
-        ax.plot(time, results['omega'], 'b-', linewidth=1.5)
-        if np.any(fault_idx):
-            ft = time[fault_idx]
-            ax.axvspan(ft[0], ft[-1], alpha=0.3, color='red', label='故障')
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('ω (p.u.)')
-        ax.set_title('转速 ω'); ax.legend(); ax.grid(True)
+        axes[1, 0].plot(time, results['omega'], 'm-', label='Speed', lw=1.5)
+        axes[1, 0].set_title('Rotor Speed'); axes[1, 0].grid(True)
 
-        ax = axes[1, 1]
-        ax.plot(time, results['PMECH'], 'c-', linewidth=1.5)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('PMECH (p.u.)')
-        ax.set_title('机械功率 PMECH'); ax.grid(True)
+        axes[1, 1].plot(time, results['Pe'], 'g-', label='P_ELEC', lw=1.5)
+        axes[1, 1].set_title('Electrical Power'); axes[1, 1].grid(True)
 
-        ax = axes[2, 0]
-        ax.plot(time, np.degrees(results['delta']), 'm-', linewidth=1.5)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('δ (°)')
-        ax.set_title('转子角 δ'); ax.grid(True)
+        axes[2, 0].plot(time, results['delta'], 'b-', label='Angle', lw=1.5)
+        axes[2, 0].set_title('Rotor Angle'); axes[2, 0].grid(True)
 
-        ax = axes[2, 1]
-        ax.plot(time, (results['omega']-1)*50, 'y-', linewidth=1.5)
-        ax.set_xlabel('时间 (s)'); ax.set_ylabel('Δf (Hz)')
-        ax.set_title('频率偏差'); ax.grid(True)
-
-        plt.tight_layout()
-
-    plt.show()
+        plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# 主程序入口
+# 快速验证
 # ============================================================
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("ENTSO-E SMIB 标准测试系统演示")
-    print("=" * 60)
-
-    # 构建系统
+if __name__ == '__main__':
     system = build_entsoe_smib_system()
-    print(f"系统已构建: {len(system['buses'])} 节点, "
-          f"{len(system['lines'])} 线路, "
-          f"{len(system['transformers'])} 变压器")
+    print("System built OK")
 
-    # 运行测试案例
-    print("\n" + "-" * 40)
-    results1 = run_test_case_1_voltage_step(system)
-    plot_test_case_results(1, results1)
+    print("\n--- Test Case 1 ---")
+    r1 = run_test_case_1_voltage_step(system, dt=0.001, t_end=1.0)
+    print(f"  Vt: {r1['Vt'][0]:.4f} -> {r1['Vt'][-1]:.4f} (max={max(r1['Vt']):.4f})")
+    print(f"  Efd: {r1['Efd'][0]:.4f} -> {r1['Efd'][-1]:.4f} (max={max(r1['Efd']):.4f})")
 
-    print("\n" + "-" * 40)
-    results2 = run_test_case_2_load_step(system)
-    plot_test_case_results(2, results2)
-
-    print("\n" + "-" * 40)
-    results3 = run_test_case_3_three_phase_fault(system)
-    plot_test_case_results(3, results3)
-
-    print("\n" + "=" * 60)
-    print("演示完成")
-    print("=" * 60)
+    print("\n--- Test Case 3 ---")
+    r3 = run_test_case_3_three_phase_fault(system, dt=0.001, t_end=2.0)
+    print(f"  Vt min: {min(r3['Vt']):.4f}")
+    print(f"  ω range: {min(r3['omega']):.4f} ~ {max(r3['omega']):.4f}")
