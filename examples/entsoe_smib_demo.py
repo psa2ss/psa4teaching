@@ -49,11 +49,12 @@ def build_entsoe_smib_system() -> Dict:
     ]
 
     line1 = Line(from_bus=1, to_bus=2, R=0.001, X=0.01, B=0.0, name="L1_NGEN_NTLV")
-    line2 = Line(from_bus=3, to_bus=4, R=0.02, X=0.199, B=0.0, name="L2_NTHV_NGRID")
+    # L2: grid equivalent, S_k''=2500 MVA, R/X=0.1, c=1.1 → Z=0.22 pu
+    line2 = Line(from_bus=3, to_bus=4, R=0.022, X=0.219, B=0.0, name="L2_NTHV_NGRID")
 
     transformer = Transformer(
         from_bus=2, to_bus=3,
-        RT=0.0, XT=0.16,
+        RT=0.0015, XT=0.16,  # u_r=0.15%, u_k=16% per ENTSO-E Table 6
         name="T1_GEN_GRID", k=419.0/21.0
     )
 
@@ -64,6 +65,11 @@ def build_entsoe_smib_system() -> Dict:
         Sb=500.0, Vb=21.0,
         Xd=2.0, Xd_prime=0.35, Xd_doubleprime=0.25,
         Xq=1.8, Xq_prime=0.5, Xq_doubleprime=0.3,
+        # NOTE: Td0_prime=0.9 etc. are the SHORT-CIRCUIT time constants
+        # (T_d', T_d'', T_q', T_q'') from ENTSO-E Table 1, matched to the
+        # simplified equation dEq'/dt = (Efd - Eq') / T_d'. The open-circuit
+        # values from ENTSO-E Table 2 are Td0'=5.143, Td0''=0.042, Tq0'=2.16,
+        # Tq0''=0.083 and would require the full field dynamics model.
         Td0_prime=0.9, Td0_doubleprime=0.03,
         Tq0_prime=0.6, Tq0_doubleprime=0.05,
         H=4.0, D=0.0, model_type='detail',
@@ -152,9 +158,14 @@ def compute_smib_voltages(delta: float, Eq_prime: float, gen: Generator,
         return 0.05, 0.0, I_fault
 
     # 正常工况
+    # SMIB 网络方程: Vt = Eq'∠δ - jXd'·I
+    # I = (Eq'∠δ - V_inf∠0) / jX_total
+    # → Vt = (X_ext/X_total)·Eq'∠δ + (Xd'/X_total)·V_inf∠0
+    a = Xd_prime / X_total   # Xd' 分压比
+    b = 1.0 - a              # X_ext 分压比
     Vt_mag = np.sqrt(
-        (V_inf_mag * Xd_prime / X_total * np.cos(delta))**2 +
-        (Eq_prime - V_inf_mag * Xd_prime / X_total * np.cos(delta))**2
+        b**2 * Eq_prime**2 + a**2 * V_inf_mag**2
+        + 2.0 * a * b * Eq_prime * V_inf_mag * np.cos(delta)
     )
     Pe = (Eq_prime * V_inf_mag / X_total) * np.sin(delta)
 
@@ -252,14 +263,14 @@ def state_derivatives(state: SMIBState, system: Dict,
 
     delta_omega = state.omega - 1.0
 
-    # 1. PSS
+    # 1. PSS (ENTSO-E Fig 2-4: IC1=1 speed, IC2=3 electrical power)
     pss_reset = is_no_load  # 空载/隔离运行关掉PSS
     if pss_reset:
         V_S = 0.0
         new_pss_state = state.pss_state.copy()
     else:
         V_S, new_pss_state = pss_model.compute_stabilizing_signal_rk4(
-            delta_omega, state.PMECH, dt, state.pss_state
+            delta_omega, Pe, dt, state.pss_state
         )
 
     # 2. 励磁系统
@@ -426,22 +437,22 @@ def run_test_case_2_load_step(system: Dict, dt: float = 0.001,
     n_steps = int(t_end / dt)
     event_idx = int(0.1 / dt)
 
-    # 负荷功率（标幺值）
-    P_load_0 = 0.76  # 380/500
+    # 负荷功率（标幺值，S_base=500 MVA）
+    # ENTSO-E: PL = 0.8 × P_r,G = 380 MW → 380/500 = 0.76 pu
+    P_load_0 = 0.76
+    # 负荷阶跃: ΔPL = +0.05 pu 以 P_r,G=475 MW 为基准
+    #   → ΔPL = 0.05 × 475 = 23.75 MW = 23.75/500 = 0.0475 pu
+    delta_PL = 0.0475
 
-    # 初始状态
-    # TGOV1 稳态：Δω=0 时，PMECH = Ref(L) = PL_0 / P_base_MW
-    # Ref(L) 的单位是标幺值（以 P_base_MW 为基准）
-    P_ref_initial = P_load_0  # 0.76 pu (以 S_base=500 为基准）
-    # 但 TGOV1 的参数 R=0.05 是调速器调差，稳态时 PMECH = Ref(L) / (1 + Dt)
-    
+    P_ref_initial = P_load_0
+
     state = SMIBState()
     state.Eq_prime = 1.03
     state.Efd = 1.0
     state.PMECH = P_load_0  # 初始机械功率
-    
-    # 调速器初始状态：x1=0, x2=0, x3=P_load_0
-    state.gov_state = np.array([0.0, 0.0, P_load_0])
+
+    # 调速器初始状态：x1=P_load_0, x2=P_load_0, x3=P_load_0
+    state.gov_state = np.array([P_load_0, P_load_0, P_load_0])
 
     results = {
         'time': np.linspace(0, t_end, n_steps),
@@ -453,47 +464,36 @@ def run_test_case_2_load_step(system: Dict, dt: float = 0.001,
         'Pe': np.zeros(n_steps),
     }
 
-    # 关掉 PSS
+    # 关掉 PSS (ENTSO-E 4.2: PSS must be switched off)
     original_KS1 = system['pss'].KS1
     system['pss'].KS1 = 0.0
     print("  PSS 已关闭 (KS1=0)")
 
-    # 负荷等效 X_ext（近似为纯有功负荷）
-    # 恒阻抗：Z_load = V²/P = 1/0.76 = 1.316 pu
-    # X_ext 不直接适用，用 no_load=False, X_ext=0 但 V_inf_mag=0
+    gen = system['generator']
+    Xd_prime = gen.Xd_prime
 
     for i in range(n_steps):
         is_step = (i >= event_idx)
-        P_cur = P_load_0 + (0.05 if is_step else 0.0)
+        P_cur = P_load_0 + (delta_PL if is_step else 0.0)
 
-        # 计算端电压
-        # 简化：孤立系统接恒阻抗负荷
-        # I = Pe / Vt  (近似)
-        # 用迭代法或直接公式
-        Vt_mag, Pe, _ = compute_smib_voltages(
-            state.delta, state.Eq_prime, system['generator'],
-            0.0, is_no_load=(P_cur < 0.01)  # 近似空载
-        )
-        # 当有负荷时，修正端电压：
-        # Vt 会因负荷电流而下降
-        if P_cur > 0.01:
-            Xd_prime = system['generator'].Xd_prime
-            Z_load = 1.0 / P_cur  # 近似
-            load_factor = 1.0 / np.sqrt(1 + ((Xd_prime * P_cur))**2)
-            Vt_mag_adjusted = state.Eq_prime * Z_load / np.sqrt(Xd_prime**2 + Z_load**2)
-            Vt_mag = min(Vt_mag, Vt_mag_adjusted)
+        # 恒阻抗负荷 Z_load = V²/P (标幺值)
+        # 孤立系统: Eq' 通过 Xd' 接到恒阻抗 Z_load
+        # 分压: Vt = Eq' * Z_load / |jXd' + Z_load|
+        Z_load = 1.0 / max(P_cur, 0.001)
+        Vt_mag = state.Eq_prime * Z_load / np.sqrt(Xd_prime**2 + Z_load**2)
+        # 电磁功率 = 负荷功率
+        Pe = P_cur
 
         results['Vt'][i] = Vt_mag
         results['Efd'][i] = state.Efd
         results['omega'][i] = state.omega
         results['delta'][i] = np.degrees(state.delta)
         results['Pm'][i] = state.PMECH
-        results['Pm'][i] = state.PMECH
         results['Pe'][i] = Pe
 
         state = rk4_integrate(state, system, dt,
                                V_ref=1.0, P_ref=P_cur,
-                               X_ext=0.0, is_no_load=(P_cur < 0.01))
+                               X_ext=0.0, is_no_load=False)
 
     system['pss'].KS1 = original_KS1
     print(f"  仿真完成: {n_steps} 步")
@@ -519,13 +519,16 @@ def run_test_case_3_three_phase_fault(system: Dict, dt: float = 0.001,
     fault_start = int(0.1 / dt)
     fault_clear = int((0.1 + fault_duration) / dt)
 
-    # 初始状态（基准潮流工况）
-    # PG = 475 MW = 0.95 pu
-    # V_inf = 1.05 pu, δ 约 30-40°
+    # 初始状态（基准潮流工况，从 ENTSO-E Fig 3-1 负荷潮流推得）
+    # PG=475 MW=0.95 pu, V_NGEN=0.992 pu, V_inf=1.05 pu
+    # 用修正后的网络参数 X_ext=0.389 (L1+Tx+L2) 自洽求解:
+    #   Pe = (Eq' * V_inf / X_total) * sin(δ) = 0.95
+    #   Vt² = b²·Eq'² + a²·V_inf² + 2ab·Eq'·V_inf·cos(δ),  a=Xd'/X_total
+    #   解得: Eq' ≈ 1.055, δ ≈ 39.3°
     state = SMIBState()
-    state.delta = np.radians(35.0)
-    state.Eq_prime = 1.1
-    state.Efd = 1.0
+    state.delta = np.radians(39.3)
+    state.Eq_prime = 1.055
+    state.Efd = 1.055  # 稳态: dEq'/dt=0 → Efd=Eq' (简化模型)
     state.PMECH = 0.95
 
     results = {

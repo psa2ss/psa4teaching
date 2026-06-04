@@ -167,74 +167,105 @@ class PSS2AParams:
 
         return A, B, C, D
 
+    def _pss2a_derivatives(self, delta_omega: float, P_gen: float,
+                           x: np.ndarray) -> np.ndarray:
+        """PSS2A 状态导数（按 ENTSO-E Fig 2-4）
+
+        N=0, M=0, T6=0, TW4=0 参数下:
+            Path 1 (speed):  ω → washout(TW1) → washout(TW2) → ×KS1
+            Path 2 (power):  Pe → washout(TW3) → [TW4=0 bypass] → 1/(1+sT7) → ×KS2
+            Sum → ×KS3 → lead-lag(T1/T2) → lead-lag(T3/T4) → limiter
+
+        状态向量 (6 维):
+            x1: washout TW1,  x2: washout TW2
+            x3: washout TW3,  x4: 1/(1+sT7)
+            x5: lead-lag T1/T2,  x6: lead-lag T3/T4
+        """
+        x1, x2, x3, x4, x5, x6 = x
+
+        # === Path 1: 转速通道 ===
+        # Washout 1: sTW1/(1+sTW1), 输入 = delta_omega
+        dx1 = (delta_omega - x1) / self.TW1
+        y1 = delta_omega - x1
+
+        # Washout 2: sTW2/(1+sTW2), 输入 = y1
+        dx2 = (y1 - x2) / self.TW2
+        y2 = y1 - x2 if self.TW2 > 0 else y1
+
+        path1 = self.KS1 * y2
+
+        # === Path 2: 功率通道 ===
+        # Washout 3: sTW3/(1+sTW3), 输入 = P_gen
+        dx3 = (P_gen - x3) / self.TW3
+        y3 = P_gen - x3
+
+        # TW4=0: 第二个 washout 旁路
+        y4 = y3
+
+        # 1/(1+sT7): 输入 = y4
+        dx4 = (y4 - x4) / self.T7
+        y5 = x4
+
+        path2 = self.KS2 * y5
+
+        # === 求和与公共通路 ===
+        V_S_raw = (path1 + path2) * self.KS3
+
+        # Lead-lag 1: (1+sT1)/(1+sT2)
+        dx5 = (V_S_raw - x5) / self.T2
+        y6 = (self.T1 / self.T2) * V_S_raw + (1.0 - self.T1 / self.T2) * x5
+
+        # Lead-lag 2: (1+sT3)/(1+sT4)
+        dx6 = (y6 - x6) / self.T4
+        # y7 不需要作为中间变量在这里返回
+
+        return np.array([dx1, dx2, dx3, dx4, dx5, dx6])
+
+    def _pss2a_output(self, delta_omega: float, P_gen: float,
+                      x: np.ndarray) -> float:
+        """从状态计算 PSS2A 输出"""
+        x1, x2, x3, x4, x5, x6 = x
+
+        # Path 1
+        y1 = delta_omega - x1
+        y2 = y1 - x2
+        path1 = self.KS1 * y2
+
+        # Path 2
+        y3 = P_gen - x3
+        y5 = x4
+        path2 = self.KS2 * y5
+
+        V_S_raw = (path1 + path2) * self.KS3
+
+        # Lead-lag chain
+        y6 = (self.T1 / self.T2) * V_S_raw + (1.0 - self.T1 / self.T2) * x5
+        y7 = (self.T3 / self.T4) * y6 + (1.0 - self.T3 / self.T4) * x6
+
+        return np.clip(y7, self.VSTMIN, self.VSTMAX)
+
     def compute_stabilizing_signal(self, delta_omega: float, P_gen: float,
                                     dt: float,
                                     state: Optional[np.ndarray] = None) -> Tuple[float, np.ndarray]:
-        """时域计算 PSS2A 稳定信号输出（简化版，欧拉法）
+        """时域计算 PSS2A 稳定信号输出（欧拉法）
+
+        按 ENTSO-E Fig 2-4 实现双输入 PSS2A 结构。
 
         Args:
-            delta_omega: 转速偏差 Δω（标幺值）
-            P_gen: 发电机有功功率（标幺值）
+            delta_omega: 转速偏差 Δω（标幺值）, IC1=1
+            P_gen: 发电机电磁功率（标幺值）, IC2=3
             dt: 时间步长（秒）
-            state: 当前状态向量
+            state: 当前状态向量 [x1..x6]，若为 None 则初始化为零
 
         Returns:
             (V_S, new_state): 稳定信号（标幺值）和新状态
-
-        Note:
-            简化版实现（N=0, M=0, T6=0, TW4=0）：
-            - 输入信号选择：KS3=1 选 Δω，KS3=2 选 P_gen
-            - 清洗环节：s*TW1/(1+s*TW1)
-            - 两对超前滞后环节
-            - 输出限幅在 [VSTMIN, VSTMAX]
         """
-        # 状态向量：6个状态变量
-        # x1, x2: 清洗环节
-        # x3, x4: 第一对超前滞后
-        # x5, x6: 第二对超前滞后
         if state is None:
             state = np.zeros(6)
 
-        # 输入信号选择
-        if self.KS3 == 1:
-            u = delta_omega  # 转速偏差
-        else:
-            u = P_gen  # 有功功率
-
-        u = u * self.KS1  # 乘以增益
-
-        # 清洗环节1：Gw1(s) = s*TW1/(1+s*TW1)
-        # 转换为状态空间：dx1/dt = (u - x1) / TW1, y1 = u - x1
-        x1 = state[0]
-        dx1 = (u - x1) / self.TW1
-        y1 = u - x1
-
-        # 清洗环节2：Gw2(s) = s*TW2/(1+s*TW2)（可选，简化合并到TW1）
-        # 这里简化：只使用一个清洗环节，TW2和TW3用于其他信号
-
-        # 超前滞后对1：G1(s) = (1+sT1)/(1+sT2)
-        x2 = state[1]
-        dx2 = (y1 - x2) / self.T2
-        y2 = (self.T1 / self.T2) * y1 + (1 - self.T1 / self.T2) * x2
-
-        # 超前滞后对2：G2(s) = (1+sT3)/(1+sT4)
-        x3 = state[2]
-        dx3 = (y2 - x3) / self.T4
-        y3 = (self.T3 / self.T4) * y2 + (1 - self.T3 / self.T4) * x3
-
-        # 超前环节：G3(s) = (1+sT7)
-        y4 = (1 + self.T7) * y3  # 简化：直接增益
-
-        # 欧拉积分更新状态
-        new_state = state.copy()
-        new_state[0] = x1 + dt * dx1
-        new_state[1] = x2 + dt * dx2
-        new_state[2] = x3 + dt * dx3
-        # 其他状态保持（简化版）
-
-        # 输出限幅
-        V_S = np.clip(y4, self.VSTMIN, self.VSTMAX)
-
+        dx = self._pss2a_derivatives(delta_omega, P_gen, state)
+        new_state = state + dt * dx
+        V_S = self._pss2a_output(delta_omega, P_gen, new_state)
         return V_S, new_state
 
     def compute_stabilizing_signal_rk4(self, delta_omega: float, P_gen: float,
@@ -242,11 +273,13 @@ class PSS2AParams:
                                         state: Optional[np.ndarray] = None) -> Tuple[float, np.ndarray]:
         """使用 RK4 方法计算 PSS2A 稳定信号输出
 
+        按 ENTSO-E Fig 2-4 实现双输入 PSS2A 结构（IC1=1 转速, IC2=3 功率）。
+
         Args:
             delta_omega: 转速偏差 Δω（标幺值）
-            P_gen: 发电机有功功率（标幺值）
+            P_gen: 发电机电磁功率（标幺值）
             dt: 时间步长（秒）
-            state: 当前状态向量
+            state: 当前状态向量 [x1..x6]
 
         Returns:
             (V_S, new_state): 稳定信号和新状态
@@ -254,55 +287,14 @@ class PSS2AParams:
         if state is None:
             state = np.zeros(6)
 
-        # 输入信号选择
-        if self.KS3 == 1:
-            u = delta_omega
-        else:
-            u = P_gen
-
-        u_scaled = u * self.KS1
-
         def f(x):
-            """状态导数函数"""
-            x1, x2, x3, x4, x5, x6 = x
+            return self._pss2a_derivatives(delta_omega, P_gen, x)
 
-            # 清洗环节
-            dx1 = (u_scaled - x1) / self.TW1
-            y1 = u_scaled - x1
-
-            # 超前滞后对1
-            dx2 = (y1 - x2) / self.T2
-            y2 = (self.T1 / self.T2) * y1 + (1 - self.T1 / self.T2) * x2
-
-            # 超前滞后对2
-            dx3 = (y2 - x3) / self.T4
-            y3 = (self.T3 / self.T4) * y2 + (1 - self.T3 / self.T4) * x3
-
-            # 其他状态（简化）
-            dx4 = 0.0
-            dx5 = 0.0
-            dx6 = 0.0
-
-            return np.array([dx1, dx2, dx3, dx4, dx5, dx6])
-
-        # RK4 积分
         k1 = f(state)
         k2 = f(state + dt/2 * k1)
         k3 = f(state + dt/2 * k2)
         k4 = f(state + dt * k3)
 
         new_state = state + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
-
-        # 计算输出（使用新状态）
-        x1_new = new_state[0]
-        y1 = u_scaled - x1_new
-
-        # 超前滞后链
-        y2 = (self.T1 / self.T2) * y1 + (1 - self.T1 / self.T2) * new_state[1]
-        y3 = (self.T3 / self.T4) * y2 + (1 - self.T3 / self.T4) * new_state[2]
-        y4 = (1 + self.T7) * y3
-
-        # 输出限幅
-        V_S = np.clip(y4, self.VSTMIN, self.VSTMAX)
-
+        V_S = self._pss2a_output(delta_omega, P_gen, new_state)
         return V_S, new_state

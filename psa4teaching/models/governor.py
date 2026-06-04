@@ -140,55 +140,45 @@ class TGOV1Params:
         return A, B, C, D
 
     def compute(self, delta_omega: float, dt: float,
-                state: Optional[np.ndarray] = None) -> Tuple[float, np.ndarray]:
-        """时域计算 TGOV1 调速器输出
+                state: Optional[np.ndarray] = None,
+                P_ref: float = 0.0) -> Tuple[float, np.ndarray]:
+        """时域计算 TGOV1 调速器输出（欧拉法）
+
+        ENTSO-E Fig 2-2: TGOV1 = 1/R → limiter → 1/(1+sT1) → Dt + (1+sT2)/(1+sT3)
 
         Args:
             delta_omega: 转速偏差 Δω（标幺值）
             dt: 时间步长（秒）
             state: 当前状态向量 [x1, x2, x3]，若为 None 则初始化为零
+                x1: 1/(1+sT1) 输出，x2: 1/(1+sT3) 输出，x3: PMECH（输出跟踪）
+            P_ref: 功率参考值（标幺值）
 
         Returns:
             (P_mech, new_state): 机械功率输出（标幺值）和新状态
-
-        Note:
-            使用时域欧拉积分或 RK4 方法更新状态
-            输出限制在 [VMIN, VMAX] 范围内
         """
         if state is None:
             state = np.zeros(3)
 
+        # 输入信号：u = P_ref - Δω/R
+        u = P_ref - delta_omega / self.R
+        # 阀位限幅（ENTSO-E Fig 2-2: 在 1/(1+sT1) 之前）
+        u_limited = np.clip(u, self.VMIN, self.VMAX)
+
         x1, x2, x3 = state
 
-        # 应用死区
-        if abs(delta_omega) < self.Dt:
-            delta_omega = 0.0
+        # 调速器/伺服: 1/(1+sT1), 输入 = u_limited
+        dx1 = (u_limited - x1) / self.T1
 
-        # 状态方程（三阶系统）
-        # dx1/dt = (delta_omega/R - x1) / T1
-        # dx2/dt = ((1+sT2)作用 - x2) / T3
-        # dx3/dt = (x2/T2 - x3) / T1 (简化)
+        # 汽轮机: (1+sT2)/(1+sT3) = T2/T3 + (1-T2/T3)/(1+sT3)
+        # x2 是 1/(1+sT3) 的输出, 输入 = x1
+        dx2 = (x1 - x2) / self.T3
+        turbine_out = (self.T2 / self.T3) * x1 + (1.0 - self.T2 / self.T3) * x2
 
-        # 计算中间变量
-        # 输入信号：u = P_ref - Δω/R（未包含死区）
-        # 注意：稳态时 Δω=0，P_mech = P_ref（限幅后）
-        u = P_ref - delta_omega / self.R  # 输入信号
+        # PMECH = Dt * x1 + turbine_out
+        P_mech = self.Dt * x1 + turbine_out
 
-        # 欧拉积分更新状态
-        dx1 = (u - x1) / self.T1
-        dx2 = (self.T2 * u - x2) / self.T3
-        dx3 = (u - x3) / self.T1  # 输出跟踪，稳态时 x3 = u
-
-        new_state = state + dt * np.array([dx1, dx2, dx3])
-
-        # 输出 = x3 + Dt*Δω，限制在 [VMIN, VMAX]
-        P_mech = np.clip(new_state[2] + self.Dt * delta_omega, self.VMIN, self.VMAX)
-
-        # 如果输出被限幅，调整状态
-        if P_mech >= self.VMAX:
-            new_state[2] = self.VMAX
-        elif P_mech <= self.VMIN:
-            new_state[2] = self.VMIN
+        new_state = state + dt * np.array([dx1, dx2, 0.0])
+        new_state[2] = P_mech
 
         return P_mech, new_state
 
@@ -197,10 +187,16 @@ class TGOV1Params:
                      P_ref: float = 0.0) -> Tuple[float, np.ndarray]:
         """使用 RK4 方法计算 TGOV1 调速器输出
 
+        ENTSO-E Fig 2-2 标准结构:
+            u = P_ref - Δω/R → [VMIN,VMAX] → 1/(1+sT1) → x1
+            → 分支A: Dt·x1 → PMECH
+            → 分支B: (1+sT2)/(1+sT3)·x1 → PMECH
+
         Args:
             delta_omega: 转速偏差 Δω（标幺值）
             dt: 时间步长（秒）
             state: 当前状态向量 [x1, x2, x3]
+                x1: 1/(1+sT1) 输出, x2: 1/(1+sT3) 输出, x3: PMECH（输出跟踪）
             P_ref: 功率参考值（标幺值，以汽轮机额定功率为基准）
 
         Returns:
@@ -209,34 +205,34 @@ class TGOV1Params:
         if state is None:
             state = np.zeros(3)
 
-        def f(x, u):
-            """状态导数函数：输入 u = P_ref - Δω/R"""
-            x1, x2, x3 = x
-
-            dx1 = (u - x1) / self.T1
-            dx2 = (self.T2 * u - x2) / self.T3
-            dx3 = (u - x3) / self.T1  # 稳态时 x3 = u
-
-            return np.array([dx1, dx2, dx3])
-
-        # 输入信号：u = P_ref - delta_omega / self.R
+        # 输入信号与阀位限幅
         u = P_ref - delta_omega / self.R
+        u_limited = np.clip(u, self.VMIN, self.VMAX)
+
+        def f(x):
+            """TGOV1 状态导数（按 ENTSO-E Fig 2-2）"""
+            x1, x2, _x3 = x
+
+            # 调速器/伺服: 1/(1+sT1)
+            dx1 = (u_limited - x1) / self.T1
+
+            # 汽轮机: (1+sT2)/(1+sT3) = T2/T3 + (1-T2/T3)/(1+sT3)
+            dx2 = (x1 - x2) / self.T3
+
+            return np.array([dx1, dx2, 0.0])
 
         # RK4 积分
-        k1 = f(state, u)
-        k2 = f(state + dt/2 * k1, u)
-        k3 = f(state + dt/2 * k2, u)
-        k4 = f(state + dt * k3, u)
+        k1 = f(state)
+        k2 = f(state + dt/2 * k1)
+        k3 = f(state + dt/2 * k2)
+        k4 = f(state + dt * k3)
 
         new_state = state + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
 
-        # 输出限幅
-        P_mech = np.clip(new_state[2], self.VMIN, self.VMAX)
-
-        # 限幅处理后状态调整
-        if P_mech >= self.VMAX:
-            new_state[2] = self.VMAX
-        elif P_mech <= self.VMIN:
-            new_state[2] = self.VMIN
+        # 从新状态计算 PMECH
+        x1_new, x2_new = new_state[0], new_state[1]
+        turbine_out = (self.T2 / self.T3) * x1_new + (1.0 - self.T2 / self.T3) * x2_new
+        P_mech = self.Dt * x1_new + turbine_out
+        new_state[2] = P_mech
 
         return P_mech, new_state
