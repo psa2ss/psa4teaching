@@ -606,6 +606,7 @@ def run_test_case_1_voltage_step(system: Dict, dt: float = 0.001,
         'delta': np.zeros(n_steps),
         'Pe': np.zeros(n_steps),
         'Pm': np.zeros(n_steps),
+        'Q': np.zeros(n_steps),
     }
 
     for i in range(n_steps):
@@ -621,6 +622,7 @@ def run_test_case_1_voltage_step(system: Dict, dt: float = 0.001,
         results['delta'][i] = np.degrees(state.delta)
         results['Pe'][i] = Pe
         results['Pm'][i] = state.PMECH
+        results['Q'][i] = 0.0  # 空载，无功为零
 
         state = rk4_integrate(state, system, dt,
                                V_ref=V_ref_arr[i], P_ref=0.0,
@@ -633,64 +635,164 @@ def run_test_case_1_voltage_step(system: Dict, dt: float = 0.001,
 # 测试案例 2: 负荷有功阶跃（隔离运行）
 # ============================================================
 # 配置：S-GEN 断开，NGEN 节点有附加恒阻抗负荷
-# 初始：PL = 0.8 * S_r,G * cosφ_r = 380 MW
-# 事件：t=0.1s, PL 增加 +0.05 pu
+# 初始：PL = 0.8 * S_r,G * cosφ_r = 380 MW = 0.76 pu
+# 事件：t=0.1s, PL 增加 +0.05 pu（以 Pr,G=475MW 为基准 → +0.0475 pu）
 # PSS 必须关断
 # 仿真时长：15s
 # 输出：U_NGEN, PG, PMECH, QG, ω
+#
+# 修正（v3）：
+# 1. 负荷位于 NGEN（发电机端），而非 NGRID 网络末端
+#    → 仅 Xd' = 0.35 作为 Eq' 与负荷之间的电抗
+# 2. P_ref 恒定（=初始 Pe），调速器仅响应 Δω
+# 3. 初始条件包含励磁下垂的完整稳态求解
+# 4. RK4 积分替代欧拉法
+
+def _rk4_step_isolated_load(state: SMIBState, system: Dict, dt: float,
+                             V_ref: float, P_ref: float, R_L: float) -> SMIBState:
+    """隔离负荷的 RK4 单步积分（负荷直接接在发电机端）
+
+    等效电路: Eq' → jXd' → R_L（纯电阻恒阻抗负荷）
+    网络方程内嵌在导数函数中，每个 RK4 子步都重新计算 Vt, Pe, Id.
+    """
+    gen = system['generator']
+    gov = system['governor']
+    exc = system['exciter']
+    pss_model = system['pss']
+    f_base = system['f_base']
+    Xd = gen.Xd
+    Xd_prime = gen.Xd_prime
+
+    def _deriv(s: SMIBState) -> SMIBState:
+        # 网络解: 圆转子模型，无凸极
+        Z_mag = np.sqrt(R_L**2 + Xd_prime**2)
+        I_mag = s.Eq_prime / Z_mag
+        Vt_mag = I_mag * R_L
+        Pe = I_mag**2 * R_L
+        Id = -s.Eq_prime * Xd_prime / (R_L**2 + Xd_prime**2)
+        # NOTE: Iq = s.Eq_prime * R_L / (R_L**2 + Xd_prime**2) — 调速器/励磁不需要
+
+        delta_omega = s.omega - 1.0
+
+        # PSS（KS1=0 时输出为 0，但内部状态仍需推进）
+        V_S, new_pss = pss_model.compute_stabilizing_signal_rk4(
+            delta_omega, Pe, dt, s.pss_state
+        )
+
+        # 励磁系统（SEXS）
+        Efd, new_exc = exc.compute_rk4(V_ref, Vt_mag, V_S, dt, s.exc_state)
+
+        # 调速器（TGOV1）— P_ref 恒定
+        Pm, new_gov = gov.compute_rk4(delta_omega, dt, s.gov_state, P_ref)
+
+        # 发电机状态导数
+        omega_base = 2.0 * np.pi * f_base
+        d_delta = delta_omega * omega_base
+        d_omega = (Pm - Pe - gen.D * delta_omega) / (2.0 * gen.H)
+        d_Eq_prime = (Efd - s.Eq_prime - (Xd - Xd_prime) * Id) / gen.Td0_prime
+
+        # 控制器状态导数（差分近似）
+        d_exc = (new_exc - s.exc_state) / dt
+        d_gov = (new_gov - s.gov_state) / dt
+        d_pss = (new_pss - s.pss_state) / dt
+
+        d = SMIBState()
+        d.delta = d_delta
+        d.omega = d_omega
+        d.Eq_prime = d_Eq_prime
+        d.exc_state = d_exc
+        d.gov_state = d_gov
+        d.pss_state = d_pss
+        d.Efd = Efd
+        d.PMECH = Pm
+        return d
+
+    # 构造中间状态
+    def _advance(base, k, fac):
+        return SMIBState(
+            delta=base.delta + fac * k.delta,
+            omega=base.omega + fac * k.omega,
+            Eq_prime=base.Eq_prime + fac * k.Eq_prime,
+            exc_state=base.exc_state + fac * k.exc_state,
+            gov_state=base.gov_state + fac * k.gov_state,
+            pss_state=base.pss_state + fac * k.pss_state,
+        )
+
+    k1 = _deriv(state)
+    k2 = _deriv(_advance(state, k1, dt / 2.0))
+    k3 = _deriv(_advance(state, k2, dt / 2.0))
+    k4 = _deriv(_advance(state, k3, dt))
+
+    s_new = SMIBState()
+    s_new.delta   = state.delta   + dt / 6.0 * (k1.delta   + 2.0*k2.delta   + 2.0*k3.delta   + k4.delta)
+    s_new.omega   = state.omega   + dt / 6.0 * (k1.omega   + 2.0*k2.omega   + 2.0*k3.omega   + k4.omega)
+    s_new.Eq_prime = state.Eq_prime + dt / 6.0 * (k1.Eq_prime + 2.0*k2.Eq_prime + 2.0*k3.Eq_prime + k4.Eq_prime)
+    s_new.exc_state = state.exc_state + dt / 6.0 * (k1.exc_state + 2.0*k2.exc_state + 2.0*k3.exc_state + k4.exc_state)
+    s_new.gov_state = state.gov_state + dt / 6.0 * (k1.gov_state + 2.0*k2.gov_state + 2.0*k3.gov_state + k4.gov_state)
+    s_new.pss_state = state.pss_state + dt / 6.0 * (k1.pss_state + 2.0*k2.pss_state + 2.0*k3.pss_state + k4.pss_state)
+    s_new.Efd = k4.Efd
+    s_new.PMECH = k4.PMECH
+    return s_new
+
 
 def run_test_case_2_load_step(system: Dict, dt: float = 0.001,
                                  t_end: float = 15.0) -> Dict:
     """测试案例 2：负荷有功阶跃（隔离运行 + 恒阻抗负荷）
 
-    S-GEN 断开，负荷 GRIDL 位于 NGRID 节点（网络末端），经线路和变压器
-    与发电机相连。等效电路为 RL 串联：
-        Eq'∠δ → jX_total → R_L（负荷电阻）
+    S-GEN 断开，附加恒阻抗负荷直接接在 NGEN（发电机端 21kV）。
+    等效电路: Eq' → jXd' → R_L（纯电阻负荷在发电机端）
 
-    X_total = X_line1 + X_transformer + X_line2 = 0.389 pu
+    调速器 P_ref 保持恒定，仅靠 Δω 反馈响应负荷变化。
     """
-    print("运行测试案例 2: 负荷有功阶跃 +0.05 p.u.")
+    print("运行测试案例 2: 负荷有功阶跃 +0.05 p.u. (隔离运行)")
 
     n_steps = int(t_end / dt)
     event_idx = int(0.1 / dt)
 
+    gen = system['generator']
+    exc = system['exciter']
+    Xd = gen.Xd
+    Xd_prime = gen.Xd_prime
+
     P_load_0 = 0.76       # 380 MW → 0.76 pu (S_base=500 MVA)
     delta_PL = 0.0475     # ΔPL = 0.05 × 475/500
 
-    gen = system['generator']
-    lines = system['lines']
-    tx = system['transformers'][0]
-    X_total = lines[0].X + tx.XT + lines[1].X  # 0.389
+    R_L0 = 1.0 / P_load_0                         # 初始负荷电阻
+    R_L1 = 1.0 / (P_load_0 + delta_PL)            # 阶跃后负荷电阻
 
-    # 求解初始稳态
-    P_cur = P_load_0
-    R_L = 1.0 / P_cur
-    Z_mag_sq = R_L**2 + X_total**2     # |R_L + jX_total|²
-    Z_mag = np.sqrt(Z_mag_sq)
-    cos_phi = R_L / Z_mag               # 功率因数
-    sin_phi = X_total / Z_mag
+    # ---- 求解初始稳态（含励磁下垂） ----
+    # 圆转子隔离负荷模型:
+    #   Vt = Eq' * R_L / sqrt(R_L² + Xd'²) = α * Eq'
+    #   Id = -Eq' * Xd' / (R_L² + Xd'²) = -β * Eq'
+    #   Efd_field = Eq' + (Xd - Xd') * Id
+    #   Efd_exc   = K * (V_ref - Vt)
+    #   稳态: Efd_field = Efd_exc → Eq' = K*V_ref / (K*α + 1 - (Xd-Xd')*β)
+    V_ref = 1.0
+    alpha0 = R_L0 / np.sqrt(R_L0**2 + Xd_prime**2)
+    beta0  = Xd_prime / (R_L0**2 + Xd_prime**2)
+    K_exc  = exc.K
 
-    # Eq' 使得 V_load = 1.0 pu
-    Eq0 = 1.0 * Z_mag / R_L
-    I_mag = Eq0 / Z_mag
-    Id0 = -I_mag * sin_phi             # 感性负荷下的 d 轴去磁电流
-    Iq0 = I_mag * cos_phi
+    Eq0  = K_exc * V_ref / (K_exc * alpha0 + 1.0 - (Xd - Xd_prime) * beta0)
+    Vt0  = alpha0 * Eq0
+    Id0  = -beta0 * Eq0
+    Efd0 = Eq0 + (Xd - Xd_prime) * Id0
+    Pe0  = Eq0**2 * R_L0 / (R_L0**2 + Xd_prime**2)
 
-    Pe0 = I_mag**2 * R_L
-    Vt0 = I_mag * R_L
+    P_ref = Pe0  # 调速器功率参考值（恒定不变）
 
-    Efd0 = Eq0 + (gen.Xd - gen.Xd_prime) * Id0
-    Efd0 = max(Efd0, 0.0)
+    print(f"  初始稳态: Vt={Vt0:.4f}, Eq'={Eq0:.4f}, Efd={Efd0:.4f}, Pe={Pe0:.4f}")
+    print(f"  V_ref={V_ref:.3f}, P_ref={P_ref:.4f} (恒定)")
+    print(f"  R_L0={R_L0:.4f} → R_L1={R_L1:.4f}")
 
-    print(f"  孤立系统初始条件: Eq'={Eq0:.4f}, V_load={Vt0:.4f}, "
-          f"Pe={Pe0:.4f}, Efd={Efd0:.4f}")
-
+    # 初始化状态
     state = SMIBState()
+    state.delta = 0.0          # 隔离运行，δ 无参考意义
+    state.omega = 1.0
     state.Eq_prime = Eq0
     state.Efd = Efd0
     state.PMECH = Pe0
-    exc = system['exciter']
-    Verr_ss = Efd0 / exc.K
+
+    Verr_ss = Efd0 / K_exc
     state.exc_state = np.array([Verr_ss, Efd0, Efd0])
     state.gov_state = np.array([Pe0, Pe0, Pe0])
 
@@ -702,27 +804,24 @@ def run_test_case_2_load_step(system: Dict, dt: float = 0.001,
         'delta': np.zeros(n_steps),
         'Pm': np.zeros(n_steps),
         'Pe': np.zeros(n_steps),
+        'Q': np.zeros(n_steps),
     }
 
+    # 禁用 PSS
     original_KS1 = system['pss'].KS1
     system['pss'].KS1 = 0.0
     print("  PSS 已关闭 (KS1=0)")
 
     for i in range(n_steps):
-        is_step = (i >= event_idx)
-        P_cur = P_load_0 + (delta_PL if is_step else 0.0)
+        R_L = R_L1 if i >= event_idx else R_L0
 
-        R_L = 1.0 / max(P_cur, 0.001)
-        Z_mag_sq = R_L**2 + X_total**2
-        Z_mag = np.sqrt(Z_mag_sq)
-        cos_phi = R_L / Z_mag
-        sin_phi = X_total / Z_mag
-
+        # 网络解（用于记录）
+        Z_mag = np.sqrt(R_L**2 + Xd_prime**2)
         I_mag = state.Eq_prime / Z_mag
-        Id = -I_mag * sin_phi
-        Iq = I_mag * cos_phi
         Vt_mag = I_mag * R_L
         Pe = I_mag**2 * R_L
+        # 纯电阻负荷，机端无功为 0
+        Q_gen = 0.0
 
         results['Vt'][i] = Vt_mag
         results['Efd'][i] = state.Efd
@@ -730,22 +829,14 @@ def run_test_case_2_load_step(system: Dict, dt: float = 0.001,
         results['delta'][i] = np.degrees(state.delta)
         results['Pm'][i] = state.PMECH
         results['Pe'][i] = Pe
+        results['Q'][i] = Q_gen
 
-        # 使用预计算的 Vt, Pe, Id 推进状态
-        deriv = state_derivatives_isolated(state, system,
-                                            V_ref=1.0, P_ref=P_cur, dt=dt,
-                                            Vt_mag=Vt_mag, Pe=Pe, Id=Id)
-        state.delta += dt * deriv.delta
-        state.omega += dt * deriv.omega
-        state.Eq_prime += dt * deriv.Eq_prime
-        state.exc_state += dt * deriv.exc_state
-        state.gov_state += dt * deriv.gov_state
-        state.pss_state += dt * deriv.pss_state
-        state.Efd = deriv.Efd
-        state.PMECH = deriv.PMECH
+        state = _rk4_step_isolated_load(state, system, dt, V_ref, P_ref, R_L)
 
     system['pss'].KS1 = original_KS1
     print(f"  仿真完成: {n_steps} 步")
+    print(f"  终值: Vt={results['Vt'][-1]:.4f}, ω={results['omega'][-1]:.4f}, "
+          f"Pe={results['Pe'][-1]:.4f}, PMECH={results['Pm'][-1]:.4f}")
     return results
 
 
@@ -787,6 +878,13 @@ def run_test_case_3_three_phase_fault(system: Dict, dt: float = 0.001,
     gov = system['governor']
     state.gov_state = np.array([ss['PMECH'], ss['PMECH'], ss['PMECH']])
 
+    # GRIDL 恒阻抗负荷参数（NGRID 母线, V=1.05 pu）
+    P_GRIDL_rated = 475.0 / 500.0   # 0.95 pu at V=1.0
+    Q_GRIDL_rated = 76.0 / 500.0    # 0.152 pu at V=1.0
+    V_grid = 1.05
+    P_GRIDL_val = P_GRIDL_rated * V_grid**2
+    Q_GRIDL_val = Q_GRIDL_rated * V_grid**2
+
     results = {
         'time': np.linspace(0, t_end, n_steps),
         'Vt': np.zeros(n_steps),
@@ -795,8 +893,14 @@ def run_test_case_3_three_phase_fault(system: Dict, dt: float = 0.001,
         'delta': np.zeros(n_steps),
         'Pe': np.zeros(n_steps),
         'Pm': np.zeros(n_steps),
+        'Q': np.zeros(n_steps),
+        'V_OTHSG': np.zeros(n_steps),
+        'P_GRIDL': np.full(n_steps, P_GRIDL_val),
+        'Q_GRIDL': np.full(n_steps, Q_GRIDL_val),
         'fault_active': np.zeros(n_steps, dtype=bool),
     }
+
+    pss_model = system['pss']
 
     for i in range(n_steps):
         fault_active = (fault_start <= i < fault_clear)
@@ -809,12 +913,25 @@ def run_test_case_3_three_phase_fault(system: Dict, dt: float = 0.001,
             X_ext, fault_active, V_inf_mag=1.05
         )
 
+        # 无功功率 Q_G = Vtq*Id - Vtd*Iq
+        Xd_prime = system['generator'].Xd_prime
+        Xq = system['generator'].Xq
+        Vtd = -Xq * Iq
+        Vtq = state.Eq_prime - Xd_prime * Id
+        Q_gen = Vtq * Id - Vtd * Iq
+
+        # PSS 输出 V_OTHSG
+        delta_omega = state.omega - 1.0
+        V_OTHSG = pss_model._pss2a_output(delta_omega, Pe, state.pss_state)
+
         results['Vt'][i] = Vt_mag
         results['Efd'][i] = state.Efd
         results['omega'][i] = state.omega
         results['delta'][i] = np.degrees(state.delta)
         results['Pe'][i] = Pe
         results['Pm'][i] = state.PMECH
+        results['Q'][i] = Q_gen
+        results['V_OTHSG'][i] = V_OTHSG
 
         state = rk4_integrate(state, system, dt,
                                V_ref=1.05, P_ref=0.95,
@@ -830,80 +947,139 @@ def run_test_case_3_three_phase_fault(system: Dict, dt: float = 0.001,
 # ============================================================
 
 def plot_test_case_results(case_num: int, results: Dict):
-    """绘制测试案例结果"""
+    """绘制测试案例结果（对应 ENTSO-E 报告 Fig 5-1 ~ Fig 5-14）
+
+    Test Case 1: Fig 5-1 (U_NGEN), Fig 5-2 (EFD)
+    Test Case 2: Fig 5-3 (U_NGEN), Fig 5-4 (P_G+P_MECH), Fig 5-5 (Q_G), Fig 5-6 (ω_G)
+    Test Case 3: Fig 5-7 (U_NGEN), Fig 5-8 (EFD), Fig 5-9 (P_G), Fig 5-10 (Q_G),
+                 Fig 5-11 (ω_G), Fig 5-12 (V_OTHSG), Fig 5-13 (P_GRIDL), Fig 5-14 (Q_GRIDL)
+    """
     time = results['time']
 
     if case_num == 1:
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        fig.suptitle('Test Case 1: Voltage Reference Step +0.05 pu', fontsize=14)
+        # === Fig 5-1, 5-2: 电压参考值阶跃 ===
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle('Test Case 1: Voltage Reference Step +0.05 pu', fontsize=14, fontweight='bold')
 
-        ax = axes[0, 0]
-        ax.plot(time, results['V_ref'], 'b-', label='V_ref', lw=2)
-        ax.plot(time, results['Vt'], 'r--', label='V_NGEN', lw=1.5)
-        ax.set_xlabel('Time (s)'); ax.set_ylabel('Voltage (pu)')
-        ax.set_title('Terminal Voltage'); ax.legend(); ax.grid(True)
+        ax1.plot(time, results['V_ref'], 'b-', label=r'$V_{ref}$', lw=1.5)
+        ax1.plot(time, results['Vt'], 'r--', label=r'$U_{NGEN}$', lw=1.5)
+        ax1.set_xlabel('Time (s)'); ax1.set_ylabel('Voltage (pu)')
+        ax1.set_title('Fig 5-1: Terminal Voltage $U_{NGEN}$')
+        ax1.legend(); ax1.grid(True, alpha=0.3)
+        ax1.set_xlim([0, 2.0])
 
-        ax = axes[0, 1]
-        ax.plot(time, results['Efd'], 'g-', lw=1.5)
-        ax.set_xlabel('Time (s)'); ax.set_ylabel('Efd (pu)')
-        ax.set_title('Excitation Voltage'); ax.grid(True)
-
-        ax = axes[1, 0]
-        ax.plot(time, results['omega'], 'm-', lw=1.5)
-        ax.set_xlabel('Time (s)'); ax.set_ylabel('Speed (pu)')
-        ax.set_title('Rotor Speed'); ax.grid(True)
-
-        ax = axes[1, 1]
-        ax.plot(time, results['Pe'], 'c-', lw=1.5)
-        ax.set_xlabel('Time (s)'); ax.set_ylabel('Pe (pu)')
-        ax.set_title('Electrical Power'); ax.grid(True)
+        ax2.plot(time, results['Efd'], 'g-', lw=1.5)
+        ax2.set_xlabel('Time (s)'); ax2.set_ylabel('Field Voltage (pu)')
+        ax2.set_title('Fig 5-2: Excitation Voltage $E_{FD}$')
+        ax2.grid(True, alpha=0.3)
+        ax2.set_xlim([0, 2.0])
 
         plt.tight_layout(); plt.show()
 
     elif case_num == 2:
-        fig, axes = plt.subplots(3, 2, figsize=(14, 10))
-        fig.suptitle('Test Case 2: Load Step +0.05 pu', fontsize=14)
+        # === Fig 5-3 ~ 5-6: 负荷有功阶跃 ===
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle('Test Case 2: Load Active Power Step +0.05 pu', fontsize=14, fontweight='bold')
 
-        axes[0, 0].plot(time, results['Vt'], 'r-', label='V_NGEN')
-        axes[0, 0].set_title('Terminal Voltage'); axes[0, 0].grid(True)
+        ax = axes[0, 0]
+        ax.plot(time, results['Vt'], 'r-', lw=1.5)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Voltage (pu)')
+        ax.set_title('Fig 5-3: Terminal Voltage $U_{NGEN}$')
+        ax.grid(True, alpha=0.3)
 
-        axes[0, 1].plot(time, results['Pm'], 'b-', label='P_MECH')
-        axes[0, 1].set_title('Mechanical Power'); axes[0, 1].grid(True)
+        ax = axes[0, 1]
+        ax.plot(time, results['Pe'], 'g-', label=r'$P_G$ (elec.)', lw=1.5)
+        ax.plot(time, results['Pm'], 'b--', label=r'$P_{MECH}$ (mech.)', lw=1.5)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Active Power (pu)')
+        ax.set_title('Fig 5-4: Active Power $P_G$ and $P_{MECH}$')
+        ax.legend(); ax.grid(True, alpha=0.3)
 
-        axes[1, 0].plot(time, results['omega'], 'm-', label='Speed')
-        axes[1, 0].set_title('Rotor Speed'); axes[1, 0].grid(True)
+        ax = axes[1, 0]
+        ax.plot(time, results['Q'], 'm-', lw=1.5)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Reactive Power (pu)')
+        ax.set_title('Fig 5-5: Reactive Power $Q_G$')
+        ax.grid(True, alpha=0.3)
 
-        axes[1, 1].plot(time, results['Pe'], 'g-', label='P_ELEC')
-        axes[1, 1].set_title('Electrical Power'); axes[1, 1].grid(True)
-
-        axes[2, 0].plot(time, results['Efd'], 'c-', label='Efd')
-        axes[2, 0].set_title('Excitation Voltage'); axes[2, 0].grid(True)
-
-        axes[2, 1].plot(time, results['delta'], 'y-', label='Angle')
-        axes[2, 1].set_title('Rotor Angle'); axes[2, 1].grid(True)
+        ax = axes[1, 1]
+        ax.plot(time, results['omega'], 'c-', lw=1.5)
+        ax.axhline(y=1.0, color='gray', linestyle=':', alpha=0.5)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Speed (pu)')
+        ax.set_title(r'Fig 5-6: Rotor Speed $\omega_G$')
+        ax.grid(True, alpha=0.3)
 
         plt.tight_layout(); plt.show()
 
     elif case_num == 3:
-        fig, axes = plt.subplots(3, 2, figsize=(14, 10))
-        fig.suptitle('Test Case 3: Three-Phase Short Circuit', fontsize=14)
+        # === Fig 5-7 ~ 5-14: 三相短路故障 ===
+        fig, axes = plt.subplots(4, 2, figsize=(16, 18))
+        fig.suptitle('Test Case 3: Three-Phase Short Circuit (0.1 s)', fontsize=14, fontweight='bold')
 
+        fault_line = results['fault_active'].astype(float) * 0.5
+
+        # Fig 5-7: U_NGEN
         ax = axes[0, 0]
-        ax.plot(time, results['Vt'], 'r-', label='V_NGEN', lw=1.5)
-        ax.plot(time, results['fault_active'].astype(float)*0.5, 'k--', alpha=0.3, label='Fault')
-        ax.set_title('Terminal Voltage'); ax.legend(); ax.grid(True)
+        ax.plot(time, results['Vt'], 'r-', lw=1.2)
+        ax.plot(time, fault_line, 'k--', alpha=0.3, lw=0.8)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Voltage (pu)')
+        ax.set_title('Fig 5-7: Terminal Voltage $U_{NGEN}$')
+        ax.grid(True, alpha=0.3)
 
-        axes[0, 1].plot(time, results['Efd'], 'c-', label='Efd', lw=1.5)
-        axes[0, 1].set_title('Excitation Voltage'); axes[0, 1].grid(True)
+        # Fig 5-8: EFD
+        ax = axes[0, 1]
+        ax.plot(time, results['Efd'], 'c-', lw=1.2)
+        ax.plot(time, fault_line, 'k--', alpha=0.3, lw=0.8)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Field Voltage (pu)')
+        ax.set_title('Fig 5-8: Excitation Voltage $E_{FD}$')
+        ax.grid(True, alpha=0.3)
 
-        axes[1, 0].plot(time, results['omega'], 'm-', label='Speed', lw=1.5)
-        axes[1, 0].set_title('Rotor Speed'); axes[1, 0].grid(True)
+        # Fig 5-9: P_G
+        ax = axes[1, 0]
+        ax.plot(time, results['Pe'], 'g-', lw=1.2)
+        ax.plot(time, fault_line, 'k--', alpha=0.3, lw=0.8)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Active Power (pu)')
+        ax.set_title('Fig 5-9: Generator Active Power $P_G$')
+        ax.grid(True, alpha=0.3)
 
-        axes[1, 1].plot(time, results['Pe'], 'g-', label='P_ELEC', lw=1.5)
-        axes[1, 1].set_title('Electrical Power'); axes[1, 1].grid(True)
+        # Fig 5-10: Q_G
+        ax = axes[1, 1]
+        ax.plot(time, results['Q'], 'm-', lw=1.2)
+        ax.plot(time, fault_line, 'k--', alpha=0.3, lw=0.8)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Reactive Power (pu)')
+        ax.set_title('Fig 5-10: Generator Reactive Power $Q_G$')
+        ax.grid(True, alpha=0.3)
 
-        axes[2, 0].plot(time, results['delta'], 'b-', label='Angle', lw=1.5)
-        axes[2, 0].set_title('Rotor Angle'); axes[2, 0].grid(True)
+        # Fig 5-11: ω_G
+        ax = axes[2, 0]
+        ax.plot(time, results['omega'], 'b-', lw=1.2)
+        ax.axhline(y=1.0, color='gray', linestyle=':', alpha=0.5)
+        ax.plot(time, fault_line, 'k--', alpha=0.3, lw=0.8)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Speed (pu)')
+        ax.set_title(r'Fig 5-11: Rotor Speed $\omega_G$')
+        ax.grid(True, alpha=0.3)
+
+        # Fig 5-12: V_OTHSG (PSS output)
+        ax = axes[2, 1]
+        ax.plot(time, results['V_OTHSG'], 'orange', lw=1.2)
+        ax.plot(time, fault_line, 'k--', alpha=0.3, lw=0.8)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Stabilizing Signal (pu)')
+        ax.set_title('Fig 5-12: PSS Output $V_{OTHSG}$')
+        ax.grid(True, alpha=0.3)
+
+        # Fig 5-13: P_GRIDL
+        ax = axes[3, 0]
+        ax.plot(time, results['P_GRIDL'], 'brown', lw=1.2)
+        ax.plot(time, fault_line, 'k--', alpha=0.3, lw=0.8)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Active Power (pu)')
+        ax.set_title('Fig 5-13: Load Active Power $P_{GRIDL}$')
+        ax.grid(True, alpha=0.3)
+
+        # Fig 5-14: Q_GRIDL
+        ax = axes[3, 1]
+        ax.plot(time, results['Q_GRIDL'], 'purple', lw=1.2)
+        ax.plot(time, fault_line, 'k--', alpha=0.3, lw=0.8)
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Reactive Power (pu)')
+        ax.set_title('Fig 5-14: Load Reactive Power $Q_{GRIDL}$')
+        ax.grid(True, alpha=0.3)
 
         plt.tight_layout(); plt.show()
 
