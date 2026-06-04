@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pdftotext \"F:/psa4teaching/psa4teaching/docs/Controller_Test_Report.pdf\" -)",
+      "Bash(python -c \"from examples.entsoe_smib_demo import build_entsoe_smib_system, compute_smib_voltages, get_external_reactance; s = build_entsoe_smib_system\\(\\); print\\('build OK'\\); gen = s['generator']; X_ext = get_external_reactance\\(s\\); print\\(f'X_ext={X_ext:.4f}, X_total={gen.Xd_prime+X_ext:.4f}'\\); Vt, Pe, _ = compute_smib_voltages\\(0.686, 1.055, gen, X_ext, False, 1.05\\); print\\(f'Vt={Vt:.4f} \\(expect ~0.991\\), Pe={Pe:.4f} \\(expect ~0.95\\)'\\)\")",
+      "Bash(python entsoe_smib_demo.py)",
+      "Bash(pip install *)",
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Read(//f/psa4teaching/psa4teaching/**)",
+      "Bash(pip show *)",
+      "Bash(python -c \"import psa4teaching; print\\(psa4teaching.__file__\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
