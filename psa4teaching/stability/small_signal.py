@@ -332,14 +332,25 @@ def analyze_multi_machine(
             damping_ratios.append(1.0 if ev.real < 0 else -1.0)
             frequencies.append(0.0)
 
-    # 计算参与因子
-    eigvals, eigvecs = np.linalg.eig(A)
+    # 计算参与因子（使用左右特征向量）
+    # 参与因子 p_ij = |w_ij * v_ji|，其中 w 是左特征向量，v 是右特征向量
+    # 左特征向量 = V^{-1} 的行向量（满足 w_i^T * A = λ_i * w_i^T）
+    eigvals, right_eigvecs = np.linalg.eig(A)
     n_states = 2 * n_gen
     participation = np.zeros((n_states, n_states))
 
-    for i in range(n_states):
-        for j in range(n_states):
-            participation[i, j] = abs(eigvecs[j, i]) * abs(eigvecs[j, i])
+    try:
+        # 左特征向量矩阵 L = inv(V)^T，行向量为左特征向量
+        left_eigvecs = np.linalg.inv(right_eigvecs).T
+        for i in range(n_states):
+            for j in range(n_states):
+                # p_ij = |left_eigvecs[i,j] * right_eigvecs[j,i]|
+                participation[i, j] = abs(left_eigvecs[i, j] * right_eigvecs[j, i])
+    except np.linalg.LinAlgError:
+        # 如果矩阵奇异，回退到右特征向量近似
+        for i in range(n_states):
+            for j in range(n_states):
+                participation[i, j] = abs(right_eigvecs[j, i]) ** 2
 
     if verbose:
         print(f"=== 多机系统小干扰稳定分析 ===")
@@ -353,6 +364,390 @@ def analyze_multi_machine(
                       f"(ζ={damping_ratios[idx]:.4f}, f={frequencies[idx]:.2f}Hz)")
             else:
                 print(f"  λ{i+1} = {ev.real:.4f} (非振荡)")
+
+    return SmallSignalResult(
+        stable=stable,
+        eigenvalues=eigenvalues,
+        damping_ratios=np.array(damping_ratios),
+        frequencies=np.array(frequencies),
+        participation_factors=participation,
+        state_matrix=A
+    )
+
+
+def analyze_multi_machine_detailed(
+    E_primes: List[float],
+    H_list: List[float],
+    D_list: List[float],
+    delta_0_list: List[float],
+    Ybus_reduced: NDArray[np.complex128],
+    Xd_list: Optional[List[float]] = None,
+    Xd_prime_list: Optional[List[float]] = None,
+    Xq_list: Optional[List[float]] = None,
+    Td0_prime_list: Optional[List[float]] = None,
+    Ka_list: Optional[List[float]] = None,
+    Te_list: Optional[List[float]] = None,
+    exciter_params_list: Optional[List] = None,
+    verbose: bool = False
+) -> SmallSignalResult:
+    """多机系统小干扰稳定分析（详细模型，含励磁系统动态）
+
+    支持多机系统中每台发电机的磁链衰减动态（Eq'）和励磁系统动态，
+    构造完整的线性化状态矩阵并进行特征值分析。
+
+    Args:
+        E_primes: 各发电机暂态电势 E'（标幺值）
+        H_list: 各发电机惯性时间常数（秒）
+        D_list: 各发电机阻尼系数
+        delta_0_list: 各发电机初始功角（弧度）
+        Ybus_reduced: 缩减导纳矩阵（仅含发电机内部节点）
+        Xd_list: 各发电机 d 轴同步电抗（标幺值）
+        Xd_prime_list: 各发电机 d 轴暂态电抗（标幺值）
+        Xq_list: 各发电机 q 轴同步电抗（标幺值）
+        Td0_prime_list: 各发电机 d 轴暂态开路时间常数（秒）
+        Ka_list: 各励磁系统增益（简化励磁模型）
+        Te_list: 各励磁系统时间常数（秒，简化励磁模型）
+        exciter_params_list: 各励磁系统 IEEET1Params 列表（如有则优先使用）
+        verbose: 是否打印详细信息
+
+    Returns:
+        SmallSignalResult: 小干扰稳定分析结果
+
+    Note:
+        状态变量（每台发电机 4 阶，使用简化励磁）:
+            [Δδ₁, ..., Δδₙ, Δω₁, ..., Δωₙ, ΔEq'₁, ..., ΔEq'ₙ, ΔEfd₁, ..., ΔEfdₙ]ᵀ
+
+        若提供 exciter_params_list (IEEET1)，则每台发电机增加至 6 阶:
+            [..., ΔVR_i, ΔEfd_i, ΔRf_i]ᵀ
+
+        线性化基于多机系统 dq 轴网络方程，包含:
+        - 同步转矩耦合（K1 矩阵）
+        - 磁链衰减效应（K3, K4 矩阵）
+        - 励磁调压效应（K5, K6 矩阵）
+
+        参考: Kundur Ch.12, Sec. 12.5-12.6
+    """
+    n_gen = len(E_primes)
+    omega_s = 2 * np.pi * 50
+
+    # 默认参数
+    if Xd_list is None:
+        Xd_list = [1.8] * n_gen
+    if Xd_prime_list is None:
+        Xd_prime_list = [0.3] * n_gen
+    if Xq_list is None:
+        Xq_list = [1.7] * n_gen
+    if Td0_prime_list is None:
+        Td0_prime_list = [8.0] * n_gen
+    if Ka_list is None:
+        Ka_list = [50.0] * n_gen
+    if Te_list is None:
+        Te_list = [0.3] * n_gen
+
+    G = Ybus_reduced.real
+    B = Ybus_reduced.imag
+
+    # ================================================================
+    # Step 1: 计算初始运行点的 dq 轴电气量
+    # ================================================================
+    Id0 = np.zeros(n_gen)
+    Iq0 = np.zeros(n_gen)
+    Pe0 = np.zeros(n_gen)
+    Vd0 = np.zeros(n_gen)
+    Vq0 = np.zeros(n_gen)
+    Vt0 = np.zeros(n_gen)
+
+    for i in range(n_gen):
+        # dq 轴电流（多机网络方程）
+        for k in range(n_gen):
+            delta_ik = delta_0_list[k] - delta_0_list[i]
+            Id0[i] += E_primes[k] * (
+                G[i, k] * np.cos(delta_ik) - B[i, k] * np.sin(delta_ik)
+            )
+            Iq0[i] += E_primes[k] * (
+                G[i, k] * np.sin(delta_ik) + B[i, k] * np.cos(delta_ik)
+            )
+
+        # 电气功率（含凸极效应）
+        Pe0[i] = E_primes[i] * Iq0[i] + (
+            Xq_list[i] - Xd_prime_list[i]
+        ) * Id0[i] * Iq0[i]
+
+        # 端电压 dq 分量
+        Vd0[i] = Xq_list[i] * Iq0[i]
+        Vq0[i] = E_primes[i] - Xd_prime_list[i] * Id0[i]
+        Vt0[i] = np.sqrt(Vd0[i]**2 + Vq0[i]**2)
+
+    # ================================================================
+    # Step 2: 计算偏导数矩阵
+    # ================================================================
+
+    # dId/dδ, dIq/dδ, dId/dEq', dIq/dEq' (每个 n×n)
+    dId_ddelta = np.zeros((n_gen, n_gen))
+    dIq_ddelta = np.zeros((n_gen, n_gen))
+    dId_dEq = np.zeros((n_gen, n_gen))
+    dIq_dEq = np.zeros((n_gen, n_gen))
+
+    for i in range(n_gen):
+        for j in range(n_gen):
+            delta_ji = delta_0_list[j] - delta_0_list[i]
+            cos_ji = np.cos(delta_ji)
+            sin_ji = np.sin(delta_ji)
+
+            if i == j:
+                # 对角线项: ∂Id_i/∂δ_i, ∂Iq_i/∂δ_i
+                dId_ddelta[i, i] = E_primes[i] * B[i, i]
+                dIq_ddelta[i, i] = -E_primes[i] * G[i, i]
+                for k in range(n_gen):
+                    delta_ki = delta_0_list[k] - delta_0_list[i]
+                    cos_ki = np.cos(delta_ki)
+                    sin_ki = np.sin(delta_ki)
+                    dId_ddelta[i, i] += E_primes[k] * (
+                        G[i, k] * sin_ki + B[i, k] * cos_ki
+                    )
+                    dIq_ddelta[i, i] += E_primes[k] * (
+                        -G[i, k] * cos_ki + B[i, k] * sin_ki
+                    )
+                # 修正: 之前累加的对角项不对
+                # 实际上:
+                # dId_i/dδ_i = Σ_k E'_k * (G_ik*sin(δ_k-δ_i) + B_ik*cos(δ_k-δ_i))
+                # dIq_i/dδ_i = Σ_k E'_k * (-G_ik*cos(δ_k-δ_i) + B_ik*sin(δ_k-δ_i))
+                # 当 k=i: sin(0)=0, cos(0)=1
+                # dId_i/dδ_i 含 E'_i * B_ii
+                # dIq_i/dδ_i 含 -E'_i * G_ii
+                # 这个计算是对的，但上面已经加了 E_primes[i]*B[i,i]，再在循环中又加了一次
+                # 需要修正，去掉重复
+                pass
+            else:
+                # 非对角线项
+                dId_ddelta[i, j] = E_primes[j] * (
+                    -G[i, j] * sin_ji - B[i, j] * cos_ji
+                )
+                dIq_ddelta[i, j] = E_primes[j] * (
+                    G[i, j] * cos_ji - B[i, j] * sin_ji
+                )
+
+            # ∂Id_i/∂Eq'_j, ∂Iq_i/∂Eq'_j
+            dId_dEq[i, j] = G[i, j] * cos_ji - B[i, j] * sin_ji
+            dIq_dEq[i, j] = G[i, j] * sin_ji + B[i, j] * cos_ji
+
+    # 修正对角线 dId/dδ 和 dIq/dδ（上面的双重计算需要修正）
+    for i in range(n_gen):
+        dId_ddelta[i, i] = 0.0
+        dIq_ddelta[i, i] = 0.0
+        for k in range(n_gen):
+            delta_ki = delta_0_list[k] - delta_0_list[i]
+            dId_ddelta[i, i] += E_primes[k] * (
+                G[i, k] * np.sin(delta_ki) + B[i, k] * np.cos(delta_ki)
+            )
+            dIq_ddelta[i, i] += E_primes[k] * (
+                -G[i, k] * np.cos(delta_ki) + B[i, k] * np.sin(delta_ki)
+            )
+
+    # dPe/dδ, dPe/dEq', dVt/dδ, dVt/dEq' (每个 n×n)
+    dPe_ddelta = np.zeros((n_gen, n_gen))
+    dPe_dEq = np.zeros((n_gen, n_gen))
+    dVt_ddelta = np.zeros((n_gen, n_gen))
+    dVt_dEq = np.zeros((n_gen, n_gen))
+
+    for i in range(n_gen):
+        Xq_i = Xq_list[i]
+        Xdp_i = Xd_prime_list[i]
+
+        for j in range(n_gen):
+            # dPe_i/dδ_j
+            dPe_ddelta[i, j] = (
+                E_primes[i] * dIq_ddelta[i, j]
+                + (Xq_i - Xdp_i) * (
+                    dId_ddelta[i, j] * Iq0[i] + Id0[i] * dIq_ddelta[i, j]
+                )
+            )
+
+            # dPe_i/dEq'_j
+            kronecker = 1.0 if i == j else 0.0
+            dPe_dEq[i, j] = (
+                kronecker * Iq0[i]
+                + E_primes[i] * dIq_dEq[i, j]
+                + (Xq_i - Xdp_i) * (
+                    dId_dEq[i, j] * Iq0[i] + Id0[i] * dIq_dEq[i, j]
+                )
+            )
+
+            # dVt_i/dδ_j
+            dVd_ddelta_ij = Xq_i * dIq_ddelta[i, j]
+            dVq_ddelta_ij = -Xdp_i * dId_ddelta[i, j]
+            if Vt0[i] > 1e-9:
+                dVt_ddelta[i, j] = (
+                    Vd0[i] * dVd_ddelta_ij + Vq0[i] * dVq_ddelta_ij
+                ) / Vt0[i]
+
+            # dVt_i/dEq'_j
+            dVd_dEq_ij = Xq_i * dIq_dEq[i, j]
+            dVq_dEq_ij = kronecker - Xdp_i * dId_dEq[i, j]
+            if Vt0[i] > 1e-9:
+                dVt_dEq[i, j] = (
+                    Vd0[i] * dVd_dEq_ij + Vq0[i] * dVq_dEq_ij
+                ) / Vt0[i]
+
+    # ================================================================
+    # Step 3: 确定是否使用 IEEET1
+    # ================================================================
+    use_ieeet1 = exciter_params_list is not None and len(exciter_params_list) == n_gen
+
+    if use_ieeet1:
+        # IEEET1: 每台发电机 6 阶
+        # 状态: [δ(×n), ω(×n), Eq'(×n), VR(×n), Efd(×n), Rf(×n)]
+        n_states_per_gen = 6
+        n_states = n_gen * n_states_per_gen
+        A = np.zeros((n_states, n_states))
+
+        # 索引偏移
+        i_delta = 0
+        i_omega = n_gen
+        i_Eqp = 2 * n_gen
+        i_VR = 3 * n_gen
+        i_Efd = 4 * n_gen
+        i_Rf = 5 * n_gen
+
+        for i in range(n_gen):
+            # dΔδ_i/dt = Δω_i (Δω in rad/s)
+            A[i_delta + i, i_omega + i] = 1.0
+
+            # dΔω_i/dt = (ωs/(2H_i)) * (Σ_dPe_dδ·Δδ + Σ_dPe_dEq·ΔEq' - D_i·Δω_i)
+            M_coeff = omega_s / (2 * H_list[i])
+            for j in range(n_gen):
+                A[i_omega + i, i_delta + j] = dPe_ddelta[i, j] * M_coeff
+                A[i_omega + i, i_Eqp + j] = dPe_dEq[i, j] * M_coeff
+            A[i_omega + i, i_omega + i] = -D_list[i] * M_coeff
+
+            # dΔEq'_i/dt = (ΔEfd_i - ΔEq'_i - (Xd-Xd')·ΔId_i) / Td0'
+            Td0 = Td0_prime_list[i]
+            Xd_Xdp = Xd_list[i] - Xd_prime_list[i]
+            for j in range(n_gen):
+                A[i_Eqp + i, i_delta + j] = -Xd_Xdp * dId_ddelta[i, j] / Td0
+                A[i_Eqp + i, i_Eqp + j] = (
+                    -1.0 - Xd_Xdp * dId_dEq[i, j]
+                ) / Td0
+            A[i_Eqp + i, i_Efd + i] = 1.0 / Td0
+
+            # IEEET1 励磁动态（3 阶）
+            exc = exciter_params_list[i]
+            # 饱和在工作点处的等效 KE
+            Efd0 = Vt0[i]  # 近似：稳态励磁电压 ≈ 端电压标幺值
+            dSE = exc._A_sat * exc._B_sat * np.exp(exc._B_sat * Efd0)
+            KE_eff = exc.KE + dSE
+
+            TA = exc.TA if exc.TA > 0 else 1e-6
+            TE = exc.TE if exc.TE > 0 else 1e-6
+            TF = exc.TF if exc.TF > 0 else 1e-6
+
+            # dΔVR/dt = (-KA/TA)·ΔVt - ΔVR/TA
+            for j in range(n_gen):
+                A[i_VR + i, i_delta + j] = -exc.KA * dVt_ddelta[i, j] / TA
+                A[i_VR + i, i_Eqp + j] = -exc.KA * dVt_dEq[i, j] / TA
+            A[i_VR + i, i_VR + i] = -1.0 / TA
+
+            # dΔEfd/dt = ΔVR/TE - KE_eff/TE·ΔEfd
+            A[i_Efd + i, i_VR + i] = 1.0 / TE
+            A[i_Efd + i, i_Efd + i] = -KE_eff / TE
+
+            # dΔRf/dt = (KF/(TF·TE))·ΔVR - (KF·KE_eff)/(TF·TE)·ΔEfd - ΔRf/TF
+            A[i_Rf + i, i_VR + i] = exc.KF / (TF * TE)
+            A[i_Rf + i, i_Efd + i] = -exc.KF * KE_eff / (TF * TE)
+            A[i_Rf + i, i_Rf + i] = -1.0 / TF
+
+    else:
+        # 简化励磁: 每台发电机 4 阶
+        # 状态: [δ(×n), ω(×n), Eq'(×n), Efd(×n)]
+        n_states_per_gen = 4
+        n_states = n_gen * n_states_per_gen
+        A = np.zeros((n_states, n_states))
+
+        i_delta = 0
+        i_omega = n_gen
+        i_Eqp = 2 * n_gen
+        i_Efd = 3 * n_gen
+
+        for i in range(n_gen):
+            # dΔδ_i/dt = Δω_i (Δω in rad/s)
+            A[i_delta + i, i_omega + i] = 1.0
+
+            # dΔω_i/dt = (ωs/(2H_i)) * (...)
+            M_coeff_i = omega_s / (2 * H_list[i])
+            for j in range(n_gen):
+                A[i_omega + i, i_delta + j] = dPe_ddelta[i, j] * M_coeff_i
+                A[i_omega + i, i_Eqp + j] = dPe_dEq[i, j] * M_coeff_i
+            A[i_omega + i, i_omega + i] = -D_list[i] * M_coeff_i
+
+            # dΔEq'_i/dt
+            Td0 = Td0_prime_list[i]
+            Xd_Xdp = Xd_list[i] - Xd_prime_list[i]
+            for j in range(n_gen):
+                A[i_Eqp + i, i_delta + j] = -Xd_Xdp * dId_ddelta[i, j] / Td0
+                A[i_Eqp + i, i_Eqp + j] = (
+                    -1.0 - Xd_Xdp * dId_dEq[i, j]
+                ) / Td0
+            A[i_Eqp + i, i_Efd + i] = 1.0 / Td0
+
+            # dΔEfd_i/dt = (-KA_i/Te_i)·ΔVt_i - ΔEfd_i/Te_i
+            Ka = Ka_list[i]
+            Te = Te_list[i]
+            for j in range(n_gen):
+                A[i_Efd + i, i_delta + j] = -Ka * dVt_ddelta[i, j] / Te
+                A[i_Efd + i, i_Eqp + j] = -Ka * dVt_dEq[i, j] / Te
+            A[i_Efd + i, i_Efd + i] = -1.0 / Te
+
+    # ================================================================
+    # Step 4: 特征值分析
+    # ================================================================
+    eigenvalues = np.linalg.eigvals(A)
+    stable = all(e.real < 0 for e in eigenvalues)
+
+    # 阻尼比和频率
+    damping_ratios = []
+    frequencies = []
+    for ev in eigenvalues:
+        if abs(ev.imag) > 1e-6:
+            zeta = -ev.real / abs(ev)
+            f = abs(ev.imag) / (2 * np.pi)
+            damping_ratios.append(zeta)
+            frequencies.append(f)
+        else:
+            damping_ratios.append(1.0 if ev.real < 0 else -1.0)
+            frequencies.append(0.0)
+
+    # 参与因子
+    eigvals, right_eigvecs = np.linalg.eig(A)
+    participation = np.zeros((n_states, n_states))
+    try:
+        left_eigvecs = np.linalg.inv(right_eigvecs).T
+        for i in range(n_states):
+            for j in range(n_states):
+                participation[i, j] = abs(left_eigvecs[i, j] * right_eigvecs[j, i])
+    except np.linalg.LinAlgError:
+        for i in range(n_states):
+            for j in range(n_states):
+                participation[i, j] = abs(right_eigvecs[j, i]) ** 2
+
+    if verbose:
+        print(f"=== 多机系统小干扰稳定分析（详细模型）===")
+        print(f"发电机数: {n_gen}")
+        if use_ieeet1:
+            print(f"励磁系统: IEEET1 ({n_states} 阶状态矩阵)")
+        else:
+            print(f"励磁系统: 简化励磁 KA/Te ({n_states} 阶状态矩阵)")
+        print(f"系统{'稳定' if stable else '不稳定'}")
+        print(f"\n初始运行点:")
+        for i in range(n_gen):
+            print(f"  发电机{i+1}: Pe={Pe0[i]:.4f}, Vt={Vt0[i]:.4f}, "
+                  f"Id={Id0[i]:.4f}, Iq={Iq0[i]:.4f}")
+        print(f"\n特征值（仅显示振荡模式）:")
+        osc_modes = [(abs(ev.imag), ev, damping_ratios[idx], frequencies[idx])
+                     for idx, ev in enumerate(eigenvalues) if abs(ev.imag) > 1e-6]
+        osc_modes.sort(key=lambda x: x[3])  # 按频率排序
+        for _, ev, zeta, f in osc_modes:
+            print(f"  λ = {ev.real:+.4f} ± j{abs(ev.imag):.4f}  "
+                  f"(ζ={zeta:+.4f}, f={f:.4f} Hz)")
 
     return SmallSignalResult(
         stable=stable,

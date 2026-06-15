@@ -24,11 +24,23 @@ from psa4teaching.stability.small_signal import (
     SmallSignalResult,
     analyze_single_machine_infinite_bus,
     analyze_multi_machine,
+    analyze_multi_machine_detailed,
 )
 from psa4teaching.stability.equal_area_interactive import (
     EqualAreaParams,
     EqualAreaInteractive,
     show_equal_area_interactive,
+)
+from psa4teaching.stability.heffron_phillips import (
+    HeffronPhillipsResult,
+    compute_heffron_phillips_constants,
+    sweep_k_constants,
+)
+from psa4teaching.stability.voltage_stability import (
+    PVCurveResult,
+    QVCurveResult,
+    compute_pv_curve,
+    compute_qv_curve,
 )
 
 __all__ = [
@@ -41,8 +53,18 @@ __all__ = [
     "SmallSignalResult",
     "analyze_single_machine_infinite_bus",
     "analyze_multi_machine",
+    "analyze_multi_machine_detailed",
     # 等面积准则交互工具
     "EqualAreaParams",
     "EqualAreaInteractive",
     "show_equal_area_interactive",
+    # Heffron-Phillips K1-K6 常数
+    "HeffronPhillipsResult",
+    "compute_heffron_phillips_constants",
+    "sweep_k_constants",
+    # 电压稳定性分析
+    "PVCurveResult",
+    "QVCurveResult",
+    "compute_pv_curve",
+    "compute_qv_curve",
 ]

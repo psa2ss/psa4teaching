@@ -2,7 +2,7 @@
 
 > 用 Python 解决电力系统分析课本计算题  
 > 适用于：电力系统分析课程初学者（无需 Python 基础）  
-> 参考教材：陈珩《电力系统稳态分析》、李光琦《电力系统暂态分析》
+> 参考教材：陈珩《电力系统稳态分析》、李光琦《电力系统暂态分析》、Kundur《Power System Stability and Control》
 
 ---
 
@@ -14,9 +14,13 @@
 - [第四课：潮流计算](#第四课潮流计算)
 - [第五课：短路计算](#第五课短路计算)
 - [第六课：稳定计算](#第六课稳定计算)
+- [第七课：励磁与控制系统](#第七课励磁与控制系统)
+- [第八课：电压稳定性分析](#第八课电压稳定性分析)
 - [附录A：常见错误与排错](#附录a常见错误与排错)
 - [附录B：课本例题对照表](#附录b课本例题对照表)
 - [附录C：常用公式速查](#附录c常用公式速查)
+- [附录D：完整代码模板](#附录d完整代码模板)
+- [附录E：Kundur 教材 Notebook 索引](#附录e-kundur-教材-notebook-索引)
 
 ---
 
@@ -123,10 +127,16 @@ print(len(buses))   # 5
 要使用 psa4teaching，需要先"导入"它：
 
 ```python
-# 导入需要的类和函数
+# 导入需要的类和函数（核心模块）
 from psa4teaching.models import Bus, BusType, Line, Transformer, Generator, Load
 from psa4teaching.network import build_ybus, build_zbus
 from psa4teaching.powerflow import run_newton_raphson
+
+# 扩展模块（进阶使用）
+from psa4teaching.models import GeneratorModelType, LoadModel         # 模型类型枚举
+from psa4teaching.models import IEEET1Params, SEXSParams, TGOV1Params  # 控制器模型
+from psa4teaching.utils.transform import park_transform                 # 坐标变换
+from psa4teaching.data import create_kundur_two_area_system             # 标准测试系统
 ```
 
 这就像从工具箱里拿出需要的工具。每次运行程序时都要先导入。
@@ -249,6 +259,25 @@ generators = [
 > - `Xd_prime`：暂态电抗 $X_d'$，用于**稳定计算**
 > - `H`：惯性时间常数（秒），典型值 3~10 秒
 > - `D`：阻尼系数
+
+**控制器模型（进阶）：**
+
+```python
+from psa4teaching.models import IEEET1Params, TGOV1Params, PSS2AParams
+
+# IEEE Type 1 励磁系统
+exciter = IEEET1Params(KA=200, TA=0.02, TE=0.5, KF=0.05, TF=1.0)
+
+# TGOV1 汽轮机调速器
+governor = TGOV1Params(R=0.05, T1=0.5, T2=3.0, T3=10.0)
+
+# PSS2A 电力系统稳定器
+pss = PSS2AParams(KS1=10.0, TW1=2.0, T1=0.25, T2=0.03)
+```
+
+> - IEEET1 是 Kundur 教材中最常用的励磁模型
+> - 控制器模型提供 `compute()` 和 `compute_rk4()` 两种积分方法
+> - 详细使用见第七课"励磁与控制系统"
 
 ### 3.6 完整示例：打印导纳矩阵
 
@@ -715,7 +744,210 @@ print(f"最大功角：{result.max_delta:.2f}°")
 > | 计算速度 | 快 | 慢 |
 > | 适用场景 | 初步分析 | 精确分析 |
 
+### 6.5 Heffron-Phillips K1-K6 分析（Kundur Ch.12）
+
+K1-K6 常数是分析励磁系统对电力系统小干扰稳定影响的经典工具：
+
+```python
+from psa4teaching.stability import compute_heffron_phillips_constants, sweep_k_constants
+import numpy as np
+
+# SMIB 系统 Heffron-Phillips 线性化
+result = compute_heffron_phillips_constants(
+    E_prime=1.2, V_infinity=1.0, X_total=0.5,
+    Xd=1.8, Xd_prime=0.3, Xq=1.7,
+    Td0_prime=8.0, H=5.0, D=0.0,
+    delta_0=np.radians(30), Ka=50, Te=0.3,
+    verbose=True
+)
+
+print(f"K1 = {result.K1:+.4f}  (同步转矩系数)")
+print(f"K5 = {result.K5:+.4f}  (dVt/ddelta)")
+print(f"K5 < 0 → AVR 引入负阻尼风险！")
+print(f"机电模式: f = {result.frequencies[0]:.2f} Hz")
+```
+
+### 6.6 多机系统小干扰稳定
+
+```python
+from psa4teaching.stability import analyze_multi_machine, analyze_multi_machine_detailed
+from psa4teaching.data import create_kundur_two_area_system
+from psa4teaching.network import build_ybus
+import numpy as np
+
+# 加载 Kundur 两区域系统
+sys = create_kundur_two_area_system()
+ybus = build_ybus(sys['lines'], sys['transformers'])
+gen_idx = [ybus.bus_indices[b] for b in [1, 2, 3, 4]]
+Y_gen = ybus.Ybus[np.ix_(gen_idx, gen_idx)]
+
+# 经典模型多机特征值分析
+result = analyze_multi_machine(
+    E_primes=[1.05, 1.03, 1.03, 1.01],
+    H_list=[6.5, 6.5, 6.175, 6.175],
+    D_list=[0.0, 0.0, 0.0, 0.0],
+    delta_0_list=[np.radians(15), np.radians(10),
+                   np.radians(-5), np.radians(-10)],
+    Ybus_reduced=Y_gen, verbose=True
+)
+
+# 参与因子分析
+pf = result.participation_factors
+print(f"区域间模式参与因子: {pf[:, 0]}")
+```
+
+### 6.7 多机系统暂态稳定
+
+```python
+from psa4teaching.stability import simulate_multi_machine_classic
+
+# 两区域系统故障仿真
+result = simulate_multi_machine_classic(
+    E_primes=[1.05, 1.03, 1.03, 1.01],
+    H_list=[6.5, 6.5, 6.175, 6.175],
+    D_list=[0.0, 0.0, 0.0, 0.0],
+    Pm_list=[7.0, 7.0, 7.19, 7.0],
+    delta_0_list=list(np.radians([20, 15, 0, -5])),
+    Ybus_reduced=Y_gen,
+    fault_time=0.1, fault_clearing_time=0.2,
+    t_end=10.0, dt=0.01
+)
+
+# result.delta 形状为 [n_steps, n_gen]
+# result.delta[:, 0] = G1 功角轨迹
+print(f"系统{'稳定' if result.stable else '不稳定'}")
+print(f"最大功角: {result.max_delta:.2f}°")
+```
+
+### 6.8 PV/QV 电压稳定性曲线
+
+```python
+from psa4teaching.stability import compute_pv_curve, compute_qv_curve
+import copy
+
+# PV 曲线 — 追踪负荷增长时的电压变化
+pv = compute_pv_curve(
+    copy.deepcopy(buses), lines, transformers, generators, loads,
+    target_bus=3, lambda_max=3.0, n_points=50, verbose=True
+)
+print(f"临界负荷因子: {pv.critical_lambda:.2f}")
+print(f"鼻点电压: {pv.V_curve[pv.nose_point_index, :].min():.4f} pu")
+
+# QV 曲线 — 评估无功裕度
+qv = compute_qv_curve(
+    copy.deepcopy(buses), lines, transformers, generators, loads,
+    target_bus=3, V_range=(0.4, 1.2), n_points=40
+)
+print(f"最小无功需求: {qv.Q_min:.4f} pu at V={qv.V_at_Qmin:.4f} pu")
+```
+
 ---
+
+## 第七课：励磁与控制系统
+
+> 励磁系统、调速器和电力系统稳定器 (PSS) 是发电机控制的核心。
+
+### 7.1 IEEET1 励磁系统
+
+```python
+from psa4teaching.models import IEEET1Params
+import numpy as np
+
+# 创建 IEEET1 励磁系统（晶闸管型快速励磁）
+exc = IEEET1Params(
+    KA=200, TA=0.02,      # 电压调节器
+    KE=1.0, TE=0.5,       # 励磁机
+    KF=0.05, TF=1.0,      # 稳定反馈
+    VR_MIN=-1.0, VR_MAX=5.0,
+    Efd_MIN=0.0, Efd_MAX=5.0
+)
+
+# 时域仿真
+state = None
+for t in np.linspace(0, 2, 2000):
+    V_ref = 1.05 if t >= 0.05 else 1.0  # 阶跃
+    efd, state = exc.compute(V_ref=V_ref, V_measured=1.0,
+                              V_S=0.0, dt=0.001, state=state)
+    # efd 为励磁电压输出
+```
+
+### 7.2 TGOV1 调速器
+
+```python
+from psa4teaching.models import TGOV1Params
+
+gov = TGOV1Params(R=0.05, T1=0.5, T2=3.0, T3=10.0)
+P_mech, state = gov.compute(delta_omega=0.01, dt=0.01, state=None)
+```
+
+### 7.3 PSS2A 电力系统稳定器
+
+```python
+from psa4teaching.models import PSS2AParams
+
+pss = PSS2AParams(KS1=10.0, TW1=2.0, T1=0.25, T2=0.03)
+V_S, state = pss.compute_stabilizing_signal(
+    delta_omega=0.01, P_gen=0.8, dt=0.01, state=None
+)
+```
+
+### 7.4 坐标变换 (Park 变换)
+
+```python
+from psa4teaching.utils.transform import park_transform, inv_park_transform
+import numpy as np
+
+theta = np.pi / 6  # 转子角度 30°
+id_val, iq_val, i0 = park_transform(1.0, -0.5, -0.5, theta)
+# 平衡三相 → id≈1.0, iq≈0.0, i0≈0.0
+```
+
+---
+
+## 第八课：电压稳定性分析
+
+> 电压稳定性是重负荷、长距离输电系统的关键问题。
+
+### 8.1 PV 曲线（鼻点检测）
+
+```python
+from psa4teaching.stability import compute_pv_curve
+import copy
+
+pv = compute_pv_curve(
+    copy.deepcopy(buses), lines, transformers, generators, loads,
+    target_bus=3, lambda_max=3.0, n_points=50, verbose=True
+)
+
+# 绘图
+import matplotlib.pyplot as plt
+plt.plot(pv.P_total, pv.V_curve[:, 2])  # 节点3的PV曲线
+plt.scatter([pv.P_total[pv.nose_point_index]],
+           [pv.V_curve[pv.nose_point_index, 2]],
+           color='red', s=100, label='鼻点 (临界点)')
+plt.xlabel('Total Load Power (pu)'); plt.ylabel('Voltage (pu)')
+plt.title(f'PV Curve - Critical lambda = {pv.critical_lambda:.2f}')
+plt.legend(); plt.grid(True, alpha=0.3); plt.show()
+```
+
+### 8.2 QV 曲线（无功裕度）
+
+```python
+from psa4teaching.stability import compute_qv_curve
+
+qv = compute_qv_curve(
+    copy.deepcopy(buses), lines, transformers, generators, loads,
+    target_bus=3, V_range=(0.3, 1.2), n_points=40
+)
+print(f"最小无功需求 Q_min = {qv.Q_min:.4f} pu")
+print(f"对应电压 V = {qv.V_at_Qmin:.4f} pu")
+print(f"无功裕度 = {qv.reactive_margin:.4f} pu")
+```
+
+> **关键理解：**
+> - PV 曲线的上半支是稳定运行区，下半支不稳定
+> - QV 曲线最低点对应最大无功传输能力
+> - 恒功率负荷比恒阻抗负荷更不利于电压稳定
 
 ## 附录A：常见错误与排错
 
@@ -764,6 +996,14 @@ print(f"节点编号：{bus_numbers}")
 | 不对称短路 | 李光琦《暂态分析》第二章 | 例2-3, 例2-4, 例2-5 |
 | 小干扰稳定 | 李光琦《暂态分析》第四章 | 例4-1 |
 | 暂态稳定 | 李光琦《暂态分析》第三章 | 例3-1, 例3-2 |
+| Park 变换 / dq0 | Kundur Ch.3 | Ex 3.1-3.8 |
+| 同步电机模型 | Kundur Ch.4 | Ex 4.1-4.3 |
+| IEEET1 励磁系统 | Kundur Ch.8 | Sec 8.6 |
+| Heffron-Phillips K1-K6 | Kundur Ch.12 | Ex 12.1-12.4 |
+| 多机特征值分析 | Kundur Ch.12 | Ex 12.5-12.6 |
+| 等面积定则 / CCT | Kundur Ch.13 | Ex 13.1-13.4 |
+| PV/QV 电压稳定性 | Kundur Ch.14 | Ex 14.1 |
+| 次同步谐振 SSR | Kundur Ch.15 | Sec 15.2-15.4 |
 
 ---
 
@@ -803,6 +1043,34 @@ $$\frac{d\omega}{dt} = \frac{P_m - P_e - D(\omega - \omega_s)}{2H}$$
 
 稳定条件：$\zeta > 0$（工程要求 $\zeta > 0.03 \sim 0.05$）
 
+### C.6 Heffron-Phillips K1-K6 常数
+
+$$K_1 = \frac{\partial P_e}{\partial \delta} = \frac{E'V_\infty}{X_{d\Sigma}}\cos\delta_0 + V_\infty^2\frac{X_d'-X_q}{X_{d\Sigma}X_{q\Sigma}}\cos 2\delta_0$$
+
+$$K_2 = \frac{\partial P_e}{\partial E_q'} = \frac{V_\infty}{X_{d\Sigma}}\sin\delta_0$$
+
+$$K_3 = \frac{X_{d\Sigma}}{X_d + X_e}$$
+
+$$K_4 = \frac{\partial E_q}{\partial \delta} = V_\infty\frac{X_d-X_d'}{X_{d\Sigma}}\sin\delta_0$$
+
+$$K_5 = \frac{\partial V_t}{\partial \delta} = \frac{V_{d0}X_q\cos\delta_0}{V_{t0}X_{q\Sigma}} - \frac{V_{q0}X_d'\sin\delta_0}{V_{t0}X_{d\Sigma}}$$
+
+$$K_6 = \frac{\partial V_t}{\partial E_q'} = \frac{V_{q0}X_e}{V_{t0}X_{d\Sigma}}$$
+
+> 当 $K_5 < 0$ 时，AVR 通过励磁通道引入负阻尼 → 需要 PSS。
+
+### C.7 电压稳定 PV 曲线
+
+负荷裕度：$\lambda_{crit} = \frac{P_{max} - P_0}{P_0}$
+
+鼻点条件：$\frac{dV}{dP} \to \infty$（潮流雅可比矩阵奇异）
+
+### C.8 SSR 电气谐振频率
+
+$$f_{er} = f_0 \sqrt{\frac{X_C}{X_d'' + X_T + X_L}} = f_0 \sqrt{K}$$
+
+其中 $K = X_C/X_L$ 为串联补偿度。
+
 ---
 
 ## 附录D：完整代码模板
@@ -817,7 +1085,8 @@ psa4teaching 快速使用模板
 """
 
 # ========== 导入 ==========
-from psa4teaching.models import Bus, BusType, Line, Transformer, Generator
+from psa4teaching.models import Bus, BusType, Line, Transformer, Generator, Load
+from psa4teaching.models import IEEET1Params, TGOV1Params  # 控制器模型
 from psa4teaching.network import build_ybus, build_zbus
 from psa4teaching.powerflow import run_newton_raphson
 from psa4teaching.shortcircuit import (
@@ -829,8 +1098,13 @@ from psa4teaching.shortcircuit import (
 from psa4teaching.stability import (
     analyze_single_machine_infinite_bus,
     simulate_single_machine_infinite_bus_classic,
+    simulate_single_machine_infinite_bus_detailed,
+    simulate_multi_machine_classic,
+    compute_heffron_phillips_constants,
+    compute_pv_curve, compute_qv_curve,
 )
 import numpy as np
+import copy
 
 # ========== 在这里定义你的系统 ==========
 
@@ -901,6 +1175,30 @@ ts_result = simulate_single_machine_infinite_bus_classic(
 print(f"系统{'稳定' if ts_result.stable else '不稳定'}")
 print(f"最大功角：{ts_result.max_delta:.2f}°")
 
+# ========== Heffron-Phillips K1-K6 分析 ==========
+print("\n" + "=" * 50)
+print("Heffron-Phillips K1-K6 分析")
+print("=" * 50)
+hp = compute_heffron_phillips_constants(
+    E_prime=1.2, V_infinity=1.0, X_total=0.5,
+    Xd=1.8, Xd_prime=0.3, Xq=1.7,
+    Td0_prime=8.0, H=6.0, D=0.0,
+    delta_0=np.radians(30), Ka=50, Te=0.3
+)
+print(f"K1={hp.K1:+.4f}, K5={hp.K5:+.4f}")
+print(f"K5 < 0 → AVR 负阻尼风险!" if hp.K5 < 0 else "K5 > 0 → 正阻尼")
+
+# ========== 电压稳定性 ==========
+print("\n" + "=" * 50)
+print("PV 曲线电压稳定性")
+print("=" * 50)
+pv = compute_pv_curve(
+    copy.deepcopy(buses), lines, transformers, generators,
+    [], target_bus=3, lambda_max=3.0, n_points=30,
+)
+print(f"临界负荷因子: {pv.critical_lambda:.2f}")
+print(f"鼻点电压: {pv.V_curve[pv.nose_point_index, 2]:.4f} pu")
+
 print("\n" + "=" * 50)
 print("计算完成！")
 print("=" * 50)
@@ -908,11 +1206,31 @@ print("=" * 50)
 
 ---
 
+## 附录E：Kundur 教材 Notebook 索引
+
+项目提供 8 个 Jupyter Notebook，完整覆盖 Kundur 教材第 3-15 章的例题：
+
+| # | Notebook | 章节 | 内容 |
+|---|----------|------|------|
+| 1 | `ch03_synchronous_machine.ipynb` | Ch.3 | 标幺值、Park 变换、相量图 |
+| 2 | `ch04_machine_models.ipynb` | Ch.4 | 稳态/暂态/次暂态电机模型 |
+| 3 | `ch08_excitation_systems.ipynb` | Ch.8 | IEEET1 励磁、参数扫描 |
+| 4 | `ch12a_smib_small_signal.ipynb` | Ch.12 | Heffron-Phillips K1-K6 |
+| 5 | `ch12b_two_area_small_signal.ipynb` | Ch.12 | 两区域特征值、参与因子 |
+| 6 | `ch13_transient_stability.ipynb` | Ch.13 | 等面积定则、CCT、多机仿真 |
+| 7 | `ch14_voltage_stability.ipynb` | Ch.14 | PV/QV 曲线、负荷模型 |
+| 8 | `ch15_subsynchronous_resonance.ipynb` | Ch.15 | SSR 谐振频率、频率扫描 |
+
+启动方式：
+```
+jupyter notebook examples/kundur/
+```
+
 > **下一步学习建议：**
 > 1. 复制附录 D 的模板，尝试修改节点数、线路参数
 > 2. 对照课本例题，验证程序结果
-> 3. 尝试添加更多节点，构建更复杂的系统
+> 3. 打开 `examples/kundur/` 中的 Kundur 教材 Notebook，逐章学习
 > 4. 探索 `powerflow/`、`shortcircuit/`、`stability/` 目录中的更多函数
 
 ---
-*教程版本：v1.0 | 日期：2026-05-16 | 基于 psa4teaching v1.0*
+*教程版本：v2.0 | 日期：2026-06-15 | 基于 psa4teaching v1.0*

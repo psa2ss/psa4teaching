@@ -37,6 +37,7 @@ psa4teaching - 电力系统分析教学Python包
 --------
 - 陈珩《电力系统稳态分析》（第三版）
 - 李光琦《电力系统暂态分析》（第三版）
+- Kundur P. *Power System Stability and Control*. McGraw-Hill, 1994.
 
 安装
 ----

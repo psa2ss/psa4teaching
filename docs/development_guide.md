@@ -483,5 +483,6 @@ ss_result = analyze_single_machine_infinite_bus(
 
 1. 陈珩. 电力系统稳态分析（第三版）. 中国电力出版社.
 2. 李光琦. 电力系统暂态分析（第三版）. 中国电力出版社.
-3. GB/T 15544-1995 三相交流系统短路电流计算.
-4. IEC 60909 Short-circuit currents in three-phase a.c. systems.
+3. Kundur P. *Power System Stability and Control*. McGraw-Hill, 1994.
+4. GB/T 15544-1995 三相交流系统短路电流计算.
+5. IEC 60909 Short-circuit currents in three-phase a.c. systems.
